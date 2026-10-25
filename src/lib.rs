@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 pub mod cli;
 pub mod config;
+pub mod dot;
 pub mod error;
 pub mod listeners;
 pub mod query;
@@ -22,3 +23,4 @@ pub mod rate_limit;
 pub mod recursor;
 pub mod server;
 pub mod stats;
+pub mod tls;

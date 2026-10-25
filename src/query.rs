@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use hickory_server::net::runtime::Time;
 use hickory_server::net::{DnsError, NetError};
-use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
+use hickory_server::proto::op::{
+    Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode,
+};
 use hickory_server::proto::rr::rdata::SOA;
 use hickory_server::proto::rr::{DNSClass, Record, RecordType};
 use hickory_server::resolver::recursor::RecursorError;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
-use hickory_server::zone_handler::MessageResponseBuilder;
+use hickory_server::zone_handler::{MessageResponseBuilder, Queries};
 use tokio::sync::Semaphore;
 
 use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
@@ -221,6 +223,143 @@ impl QueryService {
                     "failed to send DNS response"
                 );
                 drop_response(request)
+            }
+        }
+    }
+
+    pub async fn handle_malformed<R: ResponseHandler>(
+        &self,
+        source: std::net::SocketAddr,
+        header: Header,
+        queries: Queries,
+        response_handle: R,
+        started: Instant,
+    ) -> ResponseInfo {
+        let source_ip = normalize_ip(source.ip());
+
+        if !self.acl.is_allowed(source_ip, self.protocol) {
+            self.stats.record_acl_denied();
+            return self
+                .send_simple(
+                    source,
+                    header,
+                    &queries,
+                    response_handle,
+                    ResponseCode::Refused,
+                    started,
+                )
+                .await;
+        }
+
+        if self
+            .rate_limiter
+            .check_key(&RateKey::from(source_ip))
+            .is_err()
+        {
+            self.stats.record_rate_limited();
+            return self
+                .send_simple(
+                    source,
+                    header,
+                    &queries,
+                    response_handle,
+                    ResponseCode::Refused,
+                    started,
+                )
+                .await;
+        }
+
+        let _permit = match self.inflight.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.stats.record_overloaded();
+                return self
+                    .send_simple(
+                        source,
+                        header,
+                        &queries,
+                        response_handle,
+                        ResponseCode::Refused,
+                        started,
+                    )
+                    .await;
+            }
+        };
+
+        self.send_simple(
+            source,
+            header,
+            &queries,
+            response_handle,
+            ResponseCode::FormErr,
+            started,
+        )
+        .await
+    }
+
+    async fn send_simple<R: ResponseHandler>(
+        &self,
+        source: std::net::SocketAddr,
+        header: Header,
+        queries: &Queries,
+        mut response_handle: R,
+        response_code: ResponseCode,
+        started: Instant,
+    ) -> ResponseInfo {
+        let mut metadata = header.metadata;
+        metadata.message_type = MessageType::Response;
+        metadata.recursion_available = true;
+        metadata.response_code = response_code;
+        metadata.authentic_data = false;
+
+        let response = MessageResponseBuilder::new(queries, None).build_no_records(metadata);
+
+        match response_handle.send_response(response).await {
+            Ok(info) => {
+                self.stats.record(self.protocol);
+                if response_code == ResponseCode::ServFail {
+                    self.stats.record_servfail();
+                }
+
+                let elapsed_ms = started.elapsed().as_millis();
+                let query = queries.queries().first();
+                if self.query_names {
+                    tracing::info!(
+                        listener = %self.listener_name,
+                        protocol = self.protocol.as_str(),
+                        src = %source.ip(),
+                        name = query.map(|query| query.name().to_string()),
+                        qtype = query.map(|query| query.query_type().to_string()),
+                        rcode = %response_code,
+                        elapsed_ms,
+                        dnssec = false,
+                        "query completed"
+                    );
+                } else {
+                    tracing::info!(
+                        listener = %self.listener_name,
+                        protocol = self.protocol.as_str(),
+                        src = %source.ip(),
+                        qtype = query.map(|query| query.query_type().to_string()),
+                        rcode = %response_code,
+                        elapsed_ms,
+                        dnssec = false,
+                        "query completed"
+                    );
+                }
+
+                info
+            }
+            Err(error) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "failed to send DNS response"
+                );
+                ResponseInfo::from(hickory_server::proto::op::Header {
+                    metadata,
+                    counts: hickory_server::proto::op::HeaderCounts::default(),
+                })
             }
         }
     }

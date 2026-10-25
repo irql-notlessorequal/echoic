@@ -1,0 +1,106 @@
+// echoic, a recursive DNS resolver.
+// Copyright (C) IRQL_NOT_LESS_OR_EQUAL
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use anyhow::{Context, Result};
+use rustls::ServerConfig;
+use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::pem::PemObject;
+use tokio_rustls::TlsAcceptor;
+
+pub struct TlsState {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    current: RwLock<Arc<ServerConfig>>,
+}
+
+impl TlsState {
+    pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert_path = cert_path.as_ref().to_path_buf();
+        let key_path = key_path.as_ref().to_path_buf();
+        let config = load_server_config(&cert_path, &key_path)?;
+        Ok(Self {
+            cert_path,
+            key_path,
+            current: RwLock::new(config),
+        })
+    }
+        let cert_path = cert_path.as_ref().to_path_buf();
+        let key_path = key_path.as_ref().to_path_buf();
+        let config = load_server_config(&cert_path, &key_path)?;
+        Ok(Self {
+            cert_path,
+            key_path,
+            current: RwLock::new(config),
+        })
+    }
+
+    pub fn current(&self) -> Arc<ServerConfig> {
+        self.current
+            .read()
+            .expect("tls state lock poisoned")
+            .clone()
+    }
+
+    pub fn acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(self.current())
+    }
+
+    pub fn reload(&self) -> Result<()> {
+        let config = load_server_config(&self.cert_path, &self.key_path)?;
+        *self.current.write().expect("tls state lock poisoned") = config;
+        Ok(())
+    }
+}
+
+pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
+    use rustls::pki_types::CertificateDer;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .with_context(|| format!("failed to open certificate {}", cert_path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse certificate {}", cert_path.display()))?;
+
+    if cert_chain.is_empty() {
+        anyhow::bail!(
+            "certificate {} contains no certificates",
+            cert_path.display()
+        );
+    }
+
+    let key = PrivateKeyDer::from_pem_file(key_path)
+        .with_context(|| format!("failed to read private key {}", key_path.display()))?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .with_context(|| {
+            format!(
+                "failed to build TLS configuration from {} and {}",
+                cert_path.display(),
+                key_path.display()
+            )
+        })?;
+
+    config.alpn_protocols = vec![b"dot".to_vec()];
+
+    Ok(Arc::new(config))
+}

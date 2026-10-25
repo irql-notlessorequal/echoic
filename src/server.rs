@@ -21,11 +21,13 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, Protocol};
+use crate::dot::start_dot_listener;
 use crate::listeners::{ListenerRuntime, start_listener};
 use crate::query::QueryService;
 use crate::rate_limit::KeyedRateLimiter;
 use crate::recursor::build_recursor;
 use crate::stats::Stats;
+use crate::tls::TlsState;
 
 const RATE_LIMITER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -35,7 +37,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Some(listener) = config
         .listeners
         .iter()
-        .find(|listener| matches!(listener.protocol, Protocol::Dot | Protocol::Doh))
+        .find(|listener| matches!(listener.protocol, Protocol::Doh))
     {
         bail!(
             "listener {:?}: {} listeners are not implemented yet",
@@ -48,7 +50,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let stats = Arc::new(Stats::default());
     let inflight = Arc::new(Semaphore::new(config.server_limits.max_inflight_queries));
 
-    let mut runtimes = Vec::new();
+    let mut runtimes: Vec<ListenerRuntime> = Vec::new();
     for listener in &config.listeners {
         let service = QueryService::new(
             resolver.clone(),
@@ -60,16 +62,49 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             config.logging.query_names,
         );
 
-        match start_listener(listener, service, config.server_limits.query_timeout).await {
-            Ok(runtime) => runtimes.push(runtime),
-            Err(error) => {
-                for runtime in &runtimes {
-                    runtime.token.cancel();
-                    runtime.task.abort();
+        let runtime = if listener.protocol == Protocol::Dot {
+            let tls_name = listener.tls.as_deref().expect("validated tls");
+            let tls_config = config
+                .tls
+                .iter()
+                .find(|tls| tls.name == tls_name)
+                .expect("validated tls");
+            let tls_state = TlsState::load(&tls_config.cert, &tls_config.key)
+                .with_context(|| format!("listener {:?}: failed to load TLS", listener.name))?;
+            match start_dot_listener(
+                listener,
+                service,
+                std::sync::Arc::new(tls_state),
+                config.server_limits.query_timeout,
+                config.server_limits.idle_timeout,
+            )
+            .await
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    for runtime in &runtimes {
+                        runtime.token.cancel();
+                        runtime.task.abort();
+                    }
+                    return Err(
+                        error.context(format!("listener {:?}: failed to start DoT", listener.name))
+                    );
                 }
-                return Err(error);
             }
-        }
+        } else {
+            match start_listener(listener, service, config.server_limits.query_timeout).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    for runtime in &runtimes {
+                        runtime.token.cancel();
+                        runtime.task.abort();
+                    }
+                    return Err(error);
+                }
+            }
+        };
+
+        runtimes.push(runtime);
     }
 
     let limiters = runtimes

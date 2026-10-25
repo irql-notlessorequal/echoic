@@ -43,6 +43,7 @@ const DEFAULT_MAX_DOH_BODY: usize = 65_535;
 const DEFAULT_MAX_DOH_URI: usize = 8_192;
 const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 2_048;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 const PRIVATE_NETWORKS: &[&str] = &[
@@ -357,6 +358,9 @@ impl Config {
         }
         if self.server_limits.query_timeout.is_zero() {
             errors.push("server_limits.query_timeout must be greater than zero".to_owned());
+        }
+        if self.server_limits.idle_timeout.is_zero() {
+            errors.push("server_limits.idle_timeout must be greater than zero".to_owned());
         }
         if self.server_limits.shutdown_grace.is_zero() {
             errors.push("server_limits.shutdown_grace must be greater than zero".to_owned());
@@ -700,6 +704,8 @@ pub struct ServerLimits {
     pub max_inflight_queries: usize,
     #[serde(default = "default_query_timeout", with = "humantime_serde")]
     pub query_timeout: Duration,
+    #[serde(default = "default_idle_timeout", with = "humantime_serde")]
+    pub idle_timeout: Duration,
     #[serde(default = "default_shutdown_grace", with = "humantime_serde")]
     pub shutdown_grace: Duration,
 }
@@ -712,6 +718,7 @@ impl Default for ServerLimits {
             max_doh_uri: DEFAULT_MAX_DOH_URI,
             max_inflight_queries: DEFAULT_MAX_INFLIGHT_QUERIES,
             query_timeout: DEFAULT_QUERY_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
@@ -759,6 +766,10 @@ fn default_max_inflight_queries() -> usize {
 
 fn default_query_timeout() -> Duration {
     DEFAULT_QUERY_TIMEOUT
+}
+
+fn default_idle_timeout() -> Duration {
+    DEFAULT_IDLE_TIMEOUT
 }
 
 fn default_shutdown_grace() -> Duration {
