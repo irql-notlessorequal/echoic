@@ -1,0 +1,76 @@
+// echoic, a recursive DNS resolver.
+// Copyright (C) IRQL_NOT_LESS_OR_EQUAL
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::process::ExitCode;
+
+use clap::Parser;
+use echoic::cli::Cli;
+use echoic::config::{Config, LoggingConfig};
+use tracing_subscriber::filter::EnvFilter;
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("echoic: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load(&cli.config)?;
+
+    if cli.check_config {
+        println!("configuration OK");
+        return Ok(());
+    }
+
+    init_logging(&config.logging)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to build async runtime: {error}"))?;
+    runtime.block_on(echoic::server::run(config))
+}
+
+fn init_logging(logging: &LoggingConfig) -> anyhow::Result<()> {
+    logging.level_filter()?;
+
+    let mut directives = vec![logging.level.clone()];
+    if logging.level != "off" {
+        let hickory_level = if logging.query_names { "info" } else { "warn" };
+        for target in [
+            "hickory_server",
+            "hickory_resolver",
+            "hickory_proto",
+            "hickory_net",
+        ] {
+            directives.push(format!("{target}={hickory_level}"));
+        }
+    }
+
+    let filter = EnvFilter::try_new(directives.join(","))
+        .map_err(|error| anyhow::anyhow!("failed to build logging filter: {error}"))?;
+
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))
+}

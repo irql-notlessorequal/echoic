@@ -1,0 +1,31 @@
+[package]
+name = "echoic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Recursive DNS resolver with DNSSEC, DoT and DoH support"
+license = "AGPL-3.0-only"
+repository = "https://github.com/irql-notlessorequal/echoic"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+governor = "0.10"
+hickory-server = { version = "=0.26.3", features = ["dnssec-ring", "recursor", "tls-ring"] }
+humantime-serde = "1.1"
+ipnet = { version = "2.11", features = ["serde"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3.14"

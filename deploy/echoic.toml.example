@@ -1,0 +1,72 @@
+[logging]
+level = "info"
+query_names = false
+
+[policy]
+refuse_any = true
+
+[[tls]]
+name = "public"
+cert = "/etc/echoic/tls/fullchain.pem"
+key = "/etc/echoic/tls/privkey.pem"
+
+[[listeners]]
+name = "lan-udp"
+protocol = "udp"
+address = "192.168.1.10:53"
+acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
+limits = { qps = 100, burst = 200 }
+
+[[listeners]]
+name = "lan-tcp"
+protocol = "tcp"
+address = "192.168.1.10:53"
+acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
+limits = { qps = 100, burst = 200, max_connections = 512 }
+
+[[listeners]]
+name = "public-dot"
+protocol = "dot"
+address = "0.0.0.0:853"
+tls = "public"
+limits = { qps = 50, burst = 100, max_connections = 512 }
+
+[[listeners]]
+name = "public-doh"
+protocol = "doh"
+address = "0.0.0.0:443"
+tls = "public"
+hostname = "dns.example.com"
+limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests = 128 }
+
+[recursor]
+# Omit root_hints to use the embedded root hints file.
+# root_hints = "/etc/echoic/root.hints"
+# deny_server and allow_server accept CIDR lists.
+# Omit deny_server to use Hickory's recommended special-use filters.
+# deny_server = ["127.0.0.0/8", "::1/128"]
+# allow_server = []
+# deny_answers = []
+response_cache_size = 1048576
+ns_cache_size = 1024
+recursion_limit = 24
+ns_recursion_limit = 24
+qname_minimization = "strict"
+case_randomization = true
+edns_payload_len = 1232
+
+[dnssec]
+enabled = true
+# Omit trust_anchor to use Hickory's built-in root trust anchor.
+# trust_anchor = "/etc/echoic/root.key"
+nsec3_soft_iteration_limit = 150
+nsec3_hard_iteration_limit = 500
+validation_cache_size = 65536
+
+[server_limits]
+max_udp_payload = 1232
+max_doh_body = 65535
+max_doh_uri = 8192
+max_inflight_queries = 2048
+query_timeout = "10s"
+shutdown_grace = "10s"

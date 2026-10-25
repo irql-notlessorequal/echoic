@@ -1,0 +1,517 @@
+// echoic, a recursive DNS resolver.
+// Copyright (C) IRQL_NOT_LESS_OR_EQUAL
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::iter;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use hickory_server::net::runtime::Time;
+use hickory_server::net::{DnsError, NetError};
+use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
+use hickory_server::proto::rr::rdata::SOA;
+use hickory_server::proto::rr::{DNSClass, Record, RecordType};
+use hickory_server::resolver::recursor::RecursorError;
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
+use hickory_server::zone_handler::MessageResponseBuilder;
+use tokio::sync::Semaphore;
+
+use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
+use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
+use crate::recursor::RecursiveResolver;
+use crate::stats::Stats;
+
+pub struct QueryService {
+    resolver: Arc<dyn RecursiveResolver>,
+    listener_name: String,
+    protocol: Protocol,
+    acl: AclConfig,
+    rate_limiter: Arc<KeyedRateLimiter>,
+    stats: Arc<Stats>,
+    inflight: Arc<Semaphore>,
+    query_timeout: Duration,
+    max_udp_payload: u16,
+    refuse_any: bool,
+    query_names: bool,
+    validating: bool,
+}
+
+impl QueryService {
+    pub fn new(
+        resolver: Arc<dyn RecursiveResolver>,
+        listener: &ListenerConfig,
+        stats: Arc<Stats>,
+        inflight: Arc<Semaphore>,
+        server_limits: &ServerLimits,
+        refuse_any: bool,
+        query_names: bool,
+    ) -> Self {
+        let limits = listener.limits.effective(listener.protocol);
+        let validating = resolver.is_validating();
+
+        Self {
+            resolver,
+            listener_name: listener.name.clone(),
+            protocol: listener.protocol,
+            acl: listener.acl.clone(),
+            rate_limiter: Arc::new(keyed_limiter(limits.qps, limits.burst)),
+            stats,
+            inflight,
+            query_timeout: server_limits.query_timeout,
+            max_udp_payload: server_limits.max_udp_payload,
+            refuse_any,
+            query_names,
+            validating,
+        }
+    }
+
+    pub fn rate_limiter(&self) -> Arc<KeyedRateLimiter> {
+        self.rate_limiter.clone()
+    }
+
+    async fn reject<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        response_code: ResponseCode,
+        started: Instant,
+    ) -> ResponseInfo {
+        if self.protocol == Protocol::Udp {
+            drop_response(request)
+        } else {
+            self.send_status(request, response_handle, response_code, started)
+                .await
+        }
+    }
+
+    async fn send_status<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        response_code: ResponseCode,
+        started: Instant,
+    ) -> ResponseInfo {
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        metadata.response_code = response_code;
+
+        let edns = response_edns(request, self.max_udp_payload);
+        let response =
+            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
+
+        match response_handle.send_response(response).await {
+            Ok(info) => {
+                self.record_response(request, response_code, started, false);
+                info
+            }
+            Err(error) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "failed to send DNS response"
+                );
+                drop_response(request)
+            }
+        }
+    }
+
+    async fn send_message<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        message: hickory_server::proto::op::Message,
+        started: Instant,
+    ) -> ResponseInfo {
+        if self.validating && message_is_bogus(&message) {
+            tracing::warn!(
+                listener = %self.listener_name,
+                "DNSSEC validation failed"
+            );
+            return self
+                .send_status(request, response_handle, ResponseCode::ServFail, started)
+                .await;
+        }
+
+        let response_code = message.metadata.response_code;
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        metadata.response_code = response_code;
+        metadata.authentic_data = self.validating
+            && matches!(
+                response_code,
+                ResponseCode::NoError | ResponseCode::NXDomain
+            )
+            && message_is_secure(&message);
+
+        let edns = response_edns(request, self.max_udp_payload);
+        let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
+            metadata,
+            &message.answers,
+            &message.authorities,
+            iter::empty::<&Record>(),
+            &message.additionals,
+        );
+
+        match response_handle.send_response(response).await {
+            Ok(info) => {
+                self.record_response(request, response_code, started, metadata.authentic_data);
+                info
+            }
+            Err(error) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "failed to send DNS response"
+                );
+                drop_response(request)
+            }
+        }
+    }
+
+    async fn send_negative<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        negative: NegativeResponse,
+        started: Instant,
+    ) -> ResponseInfo {
+        let NegativeResponse {
+            response_code,
+            authorities,
+            soa,
+            secure,
+        } = negative;
+        let authentic_data = self.validating && secure;
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        metadata.response_code = response_code;
+        metadata.authentic_data = authentic_data;
+
+        let edns = response_edns(request, self.max_udp_payload);
+        let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
+            metadata,
+            iter::empty::<&Record>(),
+            authorities.iter(),
+            soa.iter(),
+            iter::empty::<&Record>(),
+        );
+
+        match response_handle.send_response(response).await {
+            Ok(info) => {
+                self.record_response(request, response_code, started, authentic_data);
+                info
+            }
+            Err(error) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "failed to send DNS response"
+                );
+                drop_response(request)
+            }
+        }
+    }
+
+    fn record_response(
+        &self,
+        request: &Request,
+        response_code: ResponseCode,
+        started: Instant,
+        authentic_data: bool,
+    ) {
+        self.stats.record(self.protocol);
+        if response_code == ResponseCode::ServFail {
+            self.stats.record_servfail();
+        }
+
+        let elapsed_ms = started.elapsed().as_millis();
+        if self.query_names {
+            let query = request.queries.queries().first();
+            tracing::info!(
+                listener = %self.listener_name,
+                protocol = self.protocol.as_str(),
+                src = %request.src().ip(),
+                name = query.map(|query| query.name().to_string()),
+                qtype = query.map(|query| query.query_type().to_string()),
+                rcode = %response_code,
+                elapsed_ms,
+                dnssec = authentic_data,
+                "query completed"
+            );
+        } else {
+            let query = request.queries.queries().first();
+            tracing::info!(
+                listener = %self.listener_name,
+                protocol = self.protocol.as_str(),
+                src = %request.src().ip(),
+                qtype = query.map(|query| query.query_type().to_string()),
+                rcode = %response_code,
+                elapsed_ms,
+                dnssec = authentic_data,
+                "query completed"
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl RequestHandler for QueryService {
+    async fn handle_request<R: ResponseHandler, T: Time>(
+        &self,
+        request: &Request,
+        response_handle: R,
+    ) -> ResponseInfo {
+        let started = Instant::now();
+        let source = normalize_ip(request.src().ip());
+
+        if !self.acl.is_allowed(source, self.protocol) {
+            self.stats.record_acl_denied();
+            return self
+                .reject(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        if self.rate_limiter.check_key(&RateKey::from(source)).is_err() {
+            self.stats.record_rate_limited();
+            return self
+                .reject(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        let _permit = match self.inflight.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.stats.record_overloaded();
+                return self
+                    .reject(request, response_handle, ResponseCode::Refused, started)
+                    .await;
+            }
+        };
+
+        if request.queries.len() != 1 {
+            return self
+                .send_status(request, response_handle, ResponseCode::FormErr, started)
+                .await;
+        }
+
+        if request.metadata.op_code != OpCode::Query {
+            return self
+                .send_status(request, response_handle, ResponseCode::NotImp, started)
+                .await;
+        }
+
+        if request.version() != 0 {
+            return self
+                .send_status(request, response_handle, ResponseCode::BADVERS, started)
+                .await;
+        }
+
+        if !request.metadata.recursion_desired {
+            return self
+                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        let lower_query = &request.queries.queries()[0];
+        if lower_query.query_class() != DNSClass::IN {
+            return self
+                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        if matches!(
+            lower_query.query_type(),
+            RecordType::AXFR | RecordType::IXFR
+        ) {
+            return self
+                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        if self.refuse_any && lower_query.query_type() == RecordType::ANY {
+            return self
+                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .await;
+        }
+
+        let dnssec_ok = request
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.flags().dnssec_ok);
+        let query = lower_query.original().clone();
+
+        match tokio::time::timeout(self.query_timeout, self.resolver.resolve(query, dnssec_ok))
+            .await
+        {
+            Ok(Ok(message)) => {
+                self.send_message(request, response_handle, message, started)
+                    .await
+            }
+            Ok(Err(error)) => {
+                self.handle_recursor_error(request, response_handle, error, started)
+                    .await
+            }
+            Err(_) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    timeout_ms = self.query_timeout.as_millis(),
+                    "query timed out"
+                );
+                self.send_status(request, response_handle, ResponseCode::ServFail, started)
+                    .await
+            }
+        }
+    }
+}
+
+impl QueryService {
+    async fn handle_recursor_error<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        error: RecursorError,
+        started: Instant,
+    ) -> ResponseInfo {
+        if let Some(negative) = negative_response(&error) {
+            return self
+                .send_negative(request, response_handle, negative, started)
+                .await;
+        }
+
+        tracing::warn!(
+            listener = %self.listener_name,
+            error = %error,
+            "recursive query failed"
+        );
+        self.send_status(request, response_handle, ResponseCode::ServFail, started)
+            .await
+    }
+}
+
+struct NegativeResponse {
+    response_code: ResponseCode,
+    authorities: Vec<Record>,
+    soa: Option<Record>,
+    secure: bool,
+}
+
+fn negative_response(error: &RecursorError) -> Option<NegativeResponse> {
+    match error {
+        RecursorError::Negative(data) => {
+            let response_code = if data.is_nx_domain() {
+                ResponseCode::NXDomain
+            } else {
+                ResponseCode::NoError
+            };
+            negative_from_authority_data(data.authorities.clone(), data.soa.clone(), response_code)
+        }
+        RecursorError::Net(NetError::Dns(DnsError::NoRecordsFound(records))) => {
+            negative_from_authority_data(
+                records.authorities.clone(),
+                records.soa.clone(),
+                records.response_code,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn negative_from_authority_data(
+    authorities: Option<std::sync::Arc<[Record]>>,
+    soa: Option<Box<Record<SOA>>>,
+    response_code: ResponseCode,
+) -> Option<NegativeResponse> {
+    let authorities = authorities
+        .map(|records| {
+            records
+                .iter()
+                .filter(|record| record.record_type() != RecordType::SOA)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let soa = soa.map(|record| record.into_record_of_rdata());
+    if authorities
+        .iter()
+        .chain(soa.iter())
+        .any(|record| record.proof.is_bogus())
+    {
+        return None;
+    }
+    let secure = (!authorities.is_empty() || soa.is_some())
+        && authorities.iter().all(|record| record.proof.is_secure())
+        && soa.as_ref().is_none_or(|record| record.proof.is_secure());
+
+    Some(NegativeResponse {
+        response_code,
+        authorities,
+        soa,
+        secure,
+    })
+}
+
+fn message_is_bogus(message: &hickory_server::proto::op::Message) -> bool {
+    message
+        .answers
+        .iter()
+        .chain(message.authorities.iter())
+        .chain(message.additionals.iter())
+        .any(|record| record.proof.is_bogus())
+}
+
+fn message_is_secure(message: &hickory_server::proto::op::Message) -> bool {
+    let answers_secure = records_are_secure(&message.answers);
+    let authorities_secure = records_are_secure(&message.authorities);
+
+    (answers_secure || authorities_secure)
+        && message
+            .answers
+            .iter()
+            .chain(message.authorities.iter())
+            .all(|record| record.proof.is_secure())
+}
+
+fn records_are_secure(records: &[Record]) -> bool {
+    !records.is_empty() && records.iter().all(|record| record.proof.is_secure())
+}
+
+fn response_edns(request: &Request, max_udp_payload: u16) -> Option<Edns> {
+    request.edns.as_ref().map(|edns| {
+        let mut edns = edns.clone();
+        let max_payload = edns.max_payload().max(512).min(max_udp_payload);
+        edns.set_max_payload(max_payload);
+        edns.set_version(0);
+        edns
+    })
+}
+
+fn normalize_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+fn drop_response(request: &Request) -> ResponseInfo {
+    let metadata = Metadata::response_from_request(&request.metadata);
+    ResponseInfo::from(Header {
+        metadata,
+        counts: HeaderCounts::default(),
+    })
+}

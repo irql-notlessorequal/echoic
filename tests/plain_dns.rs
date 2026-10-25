@@ -1,0 +1,524 @@
+// echoic, a recursive DNS resolver.
+// Copyright (C) IRQL_NOT_LESS_OR_EQUAL
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use echoic::config::{Config, Protocol};
+use echoic::listeners::{ListenerRuntime, start_listener};
+use echoic::query::QueryService;
+use echoic::recursor::RecursiveResolver;
+use echoic::stats::Stats;
+use hickory_server::proto::dnssec::Proof;
+use hickory_server::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_server::proto::rr::rdata::{A, SOA};
+use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_server::resolver::recursor::{AuthorityData, RecursorError};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
+
+struct MockResolver {
+    validating: bool,
+    saw_dnssec_ok: AtomicBool,
+}
+
+impl MockResolver {
+    fn new(validating: bool) -> Self {
+        Self {
+            validating,
+            saw_dnssec_ok: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl RecursiveResolver for MockResolver {
+    async fn resolve(&self, query: Query, dnssec_ok: bool) -> Result<Message, RecursorError> {
+        self.saw_dnssec_ok.store(dnssec_ok, Ordering::SeqCst);
+
+        let name = query.name().to_string();
+        let mut response = Message::response(0, OpCode::Query);
+        response.add_query(query.clone());
+
+        match name.as_str() {
+            "secure.example." => {
+                response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Secure));
+                Ok(response)
+            }
+            "large.example." => {
+                for index in 0..200 {
+                    let octet = u8::try_from(index % 250).expect("octet");
+                    response.add_answer(a_record(
+                        &name,
+                        [198, 51, 100, octet],
+                        Proof::Indeterminate,
+                    ));
+                }
+                Ok(response)
+            }
+            "missing.example." => Err(RecursorError::Negative(AuthorityData::new(
+                Box::new(query),
+                Some(Box::new(soa_record(&name, Proof::Secure))),
+                true,
+                true,
+                None,
+            ))),
+            "nodata.example." => Err(RecursorError::Negative(AuthorityData::new(
+                Box::new(query),
+                Some(Box::new(soa_record(&name, Proof::Secure))),
+                true,
+                false,
+                None,
+            ))),
+            "fail.example." => Err(RecursorError::Message("mock failure")),
+            _ => {
+                response.add_answer(a_record(&name, [192, 0, 2, 10], Proof::Indeterminate));
+                Ok(response)
+            }
+        }
+    }
+
+    fn is_validating(&self) -> bool {
+        self.validating
+    }
+}
+
+struct TestServer {
+    runtime: ListenerRuntime,
+    stats: Arc<Stats>,
+    mock: Arc<MockResolver>,
+}
+
+impl TestServer {
+    async fn stop(self) {
+        self.runtime.token.cancel();
+        let _ = self.runtime.task.await;
+    }
+}
+
+fn config_for(protocol: Protocol, listener_extra: &str) -> Config {
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "{}"
+address = "127.0.0.1:0"
+{listener_extra}
+"#,
+        protocol.as_str()
+    );
+    Config::from_toml_str(&source).expect("test configuration")
+}
+
+async fn start(protocol: Protocol, validating: bool) -> TestServer {
+    let config = config_for(protocol, "");
+    start_config(&config, validating, 16).await
+}
+
+async fn start_config(config: &Config, validating: bool, inflight: usize) -> TestServer {
+    let listener = &config.listeners[0];
+    let mock = Arc::new(MockResolver::new(validating));
+    let stats = Arc::new(Stats::default());
+    let service = QueryService::new(
+        mock.clone(),
+        listener,
+        stats.clone(),
+        Arc::new(Semaphore::new(inflight)),
+        &config.server_limits,
+        config.policy.refuse_any,
+        config.logging.query_names,
+    );
+    let runtime = start_listener(listener, service, config.server_limits.query_timeout)
+        .await
+        .expect("start listener");
+
+    TestServer {
+        runtime,
+        stats,
+        mock,
+    }
+}
+
+fn query(name: &str, query_type: RecordType) -> Message {
+    let mut message = Message::query();
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(
+        Name::from_ascii(name).expect("query name"),
+        query_type,
+    ));
+    message
+}
+
+fn a_record(name: &str, address: [u8; 4], proof: Proof) -> Record {
+    let mut record = Record::from_rdata(
+        Name::from_ascii(name).expect("record name"),
+        60,
+        RData::A(A::new(address[0], address[1], address[2], address[3])),
+    );
+    record.proof = proof;
+    record
+}
+
+fn soa_record(name: &str, proof: Proof) -> Record<SOA> {
+    let mut record = Record::<SOA>::from_rdata(
+        Name::from_ascii(name).expect("record name"),
+        300,
+        SOA::new(Name::root(), Name::root(), 1, 3600, 600, 86_400, 300),
+    );
+    record.proof = proof;
+    record
+}
+
+async fn udp_query(address: SocketAddr, message: Message) -> Message {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    socket
+        .send_to(&message.to_vec().expect("encode query"), address)
+        .await
+        .expect("send query");
+
+    let mut buffer = [0; 4096];
+    let (length, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .expect("query timed out")
+        .expect("receive response");
+    Message::from_vec(&buffer[..length]).expect("decode response")
+}
+
+async fn udp_query_times_out(address: SocketAddr, message: Message) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    let result = tokio::time::timeout(Duration::from_millis(250), async {
+        socket
+            .send_to(&message.to_vec().expect("encode query"), address)
+            .await
+            .expect("send query");
+        let mut buffer = [0; 4096];
+        socket.recv_from(&mut buffer).await
+    })
+    .await;
+
+    assert!(result.is_err(), "expected the query to be dropped");
+}
+
+async fn tcp_query(address: SocketAddr, message: Message) -> Message {
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let bytes = message.to_vec().expect("encode query");
+    let length = u16::try_from(bytes.len()).expect("query length");
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .expect("write length");
+    stream.write_all(&bytes).await.expect("write query");
+
+    let mut response_length = [0; 2];
+    stream
+        .read_exact(&mut response_length)
+        .await
+        .expect("read response length");
+    let mut response = vec![0; usize::from(u16::from_be_bytes(response_length))];
+    stream
+        .read_exact(&mut response)
+        .await
+        .expect("read response");
+    Message::from_vec(&response).expect("decode response")
+}
+
+#[tokio::test]
+async fn udp_answers_and_counts_served_queries() {
+    let server = start(Protocol::Udp, false).await;
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(response.answers.len(), 1);
+    assert!(!response.metadata.authentic_data);
+    assert_eq!(server.stats.snapshot().udp, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_answers_and_counts_served_queries() {
+    let server = start(Protocol::Tcp, false).await;
+    let response = tcp_query(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(response.answers.len(), 1);
+    assert_eq!(server.stats.snapshot().tcp, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn forwards_dnssec_ok_and_sets_ad_for_secure_answers() {
+    let server = start(Protocol::Udp, true).await;
+
+    let mut secure_query = query("secure.example.", RecordType::A);
+    let mut edns = Edns::new();
+    edns.set_version(0);
+    edns.set_max_payload(4096);
+    edns.set_dnssec_ok(true);
+    secure_query.set_edns(edns);
+
+    let response = udp_query(server.runtime.bound_address, secure_query).await;
+    assert!(response.metadata.authentic_data);
+    assert!(server.mock.saw_dnssec_ok.load(Ordering::SeqCst));
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("secure.example.", RecordType::A),
+    )
+    .await;
+    assert!(response.metadata.authentic_data);
+    assert!(!server.mock.saw_dnssec_ok.load(Ordering::SeqCst));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn preserves_negative_soa_and_nxdomain() {
+    let server = start(Protocol::Udp, true).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("missing.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+    assert!(response.metadata.authentic_data);
+    assert_eq!(
+        response
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .count(),
+        1
+    );
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("nodata.example.", RecordType::AAAA),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.answers.is_empty());
+    assert!(response.metadata.authentic_data);
+    assert_eq!(
+        response
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .count(),
+        1
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn maps_recursor_failures_to_servfail_and_counts_them() {
+    let server = start(Protocol::Udp, false).await;
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("fail.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(server.stats.snapshot().servfail, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn truncates_large_udp_responses() {
+    let server = start(Protocol::Udp, false).await;
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("large.example.", RecordType::A),
+    )
+    .await;
+
+    assert!(response.metadata.truncation);
+    assert!(response.answers.len() < 200);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rejects_invalid_and_unsupported_queries() {
+    let server = start(Protocol::Udp, false).await;
+
+    let mut multiple = query("www.example.", RecordType::A);
+    multiple.add_query(Query::query(
+        Name::from_ascii("other.example.").expect("query name"),
+        RecordType::A,
+    ));
+    assert_eq!(
+        udp_query(server.runtime.bound_address, multiple)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::FormErr
+    );
+
+    let mut no_recursion = query("www.example.", RecordType::A);
+    no_recursion.metadata.recursion_desired = false;
+    assert_eq!(
+        udp_query(server.runtime.bound_address, no_recursion)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused
+    );
+
+    let mut any = query("www.example.", RecordType::ANY);
+    any.metadata.recursion_desired = true;
+    assert_eq!(
+        udp_query(server.runtime.bound_address, any)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused
+    );
+
+    let transfer = query("example.", RecordType::AXFR);
+    assert_eq!(
+        udp_query(server.runtime.bound_address, transfer)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused
+    );
+
+    let mut bad_version = query("www.example.", RecordType::A);
+    let mut edns = Edns::new();
+    edns.set_version(1);
+    bad_version.set_edns(edns);
+    assert!(matches!(
+        udp_query(server.runtime.bound_address, bad_version)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::BADVERS | ResponseCode::BADSIG
+    ));
+
+    let mut chaos = query("www.example.", RecordType::A);
+    chaos.queries[0].set_query_class(DNSClass::CH);
+    assert_eq!(
+        udp_query(server.runtime.bound_address, chaos)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::Refused
+    );
+
+    let mut status = Message::new(0, MessageType::Query, OpCode::Status);
+    status.metadata.recursion_desired = true;
+    status.add_query(Query::query(
+        Name::from_ascii("www.example.").expect("query name"),
+        RecordType::A,
+    ));
+    assert_eq!(
+        udp_query(server.runtime.bound_address, status)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::NotImp
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn acl_denial_over_tcp_returns_refused_without_counting_served() {
+    let config = config_for(Protocol::Tcp, r#"acl = { allow = ["198.51.100.0/24"] }"#);
+    let server = start_config(&config, false, 16).await;
+    let response = tcp_query(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    let snapshot = server.stats.snapshot();
+    assert_eq!(snapshot.acl_denied, 1);
+    assert_eq!(snapshot.tcp, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rate_limit_refuses_after_burst_and_counts_it() {
+    let config = config_for(Protocol::Tcp, r#"limits = { qps = 1, burst = 1 }"#);
+    let server = start_config(&config, false, 16).await;
+
+    let first = tcp_query(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+
+    let second = tcp_query(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(second.metadata.response_code, ResponseCode::Refused);
+
+    let snapshot = server.stats.snapshot();
+    assert_eq!(snapshot.rate_limited, 1);
+    assert_eq!(snapshot.tcp, 2);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn overload_drops_udp_queries_and_counts_them() {
+    let config = config_for(Protocol::Udp, "");
+    let server = start_config(&config, false, 0).await;
+    udp_query_times_out(
+        server.runtime.bound_address,
+        query("www.example.", RecordType::A),
+    )
+    .await;
+
+    let snapshot = server.stats.snapshot();
+    assert_eq!(snapshot.overloaded, 1);
+    assert_eq!(snapshot.udp, 0);
+
+    server.stop().await;
+}
