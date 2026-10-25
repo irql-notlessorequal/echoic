@@ -145,15 +145,34 @@ address = "127.0.0.1:0"
 }
 
 #[test]
-fn startup_rejects_unimplemented_encrypted_listeners() {
+fn startup_rejects_unloadable_encrypted_listener_certificates() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config_path = directory.path().join("echoic.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[[tls]]
+name = "public"
+cert = "/nonexistent/cert.pem"
+key = "/nonexistent/key.pem"
+
+[[listeners]]
+name = "dot"
+protocol = "dot"
+address = "127.0.0.1:0"
+tls = "public"
+"#,
+    )
+    .expect("write configuration");
+
     let output = echoic()
         .args(["--config"])
-        .arg(example_config())
+        .arg(config_path)
         .output()
         .expect("run echoic");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented yet"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to load TLS"));
 }
 
 fn log_lines(child: &mut Child) -> mpsc::Receiver<String> {

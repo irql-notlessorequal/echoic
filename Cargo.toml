@@ -11,10 +11,14 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
 futures-util = "0.3"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 governor = "0.10"
+hyper = "1.11"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 hickory-net = { version = "=0.26.3", features = ["tls-ring", "tokio"] }
 hickory-server = { version = "=0.26.3", features = ["dnssec-ring", "recursor", "tls-ring"] }
 humantime-serde = "1.1"
@@ -24,6 +28,8 @@ rustls-pki-types = "1.15"
 tokio-rustls = "0.26"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["timeout"] }
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.9"
@@ -33,3 +39,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 [dev-dependencies]
 tempfile = "3.14"
 rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

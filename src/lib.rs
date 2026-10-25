@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 pub mod cli;
 pub mod config;
+pub mod doh;
 pub mod dot;
 pub mod error;
 pub mod listeners;

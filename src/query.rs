@@ -84,6 +84,18 @@ impl QueryService {
         self.rate_limiter.clone()
     }
 
+    pub fn acl(&self) -> &AclConfig {
+        &self.acl
+    }
+
+    pub fn inflight(&self) -> Arc<Semaphore> {
+        self.inflight.clone()
+    }
+
+    pub fn stats(&self) -> Arc<Stats> {
+        self.stats.clone()
+    }
+
     async fn reject<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -440,6 +452,18 @@ impl RequestHandler for QueryService {
             }
         };
 
+        self.handle_admitted_request::<R, T>(request, response_handle, started)
+            .await
+    }
+}
+
+impl QueryService {
+    pub async fn handle_admitted_request<R: ResponseHandler, T: Time>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        started: Instant,
+    ) -> ResponseInfo {
         if request.queries.len() != 1 {
             return self
                 .send_status(request, response_handle, ResponseCode::FormErr, started)
@@ -514,9 +538,7 @@ impl RequestHandler for QueryService {
             }
         }
     }
-}
 
-impl QueryService {
     async fn handle_recursor_error<R: ResponseHandler>(
         &self,
         request: &Request,

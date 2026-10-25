@@ -25,28 +25,36 @@ use tokio_rustls::TlsAcceptor;
 pub struct TlsState {
     cert_path: PathBuf,
     key_path: PathBuf,
+    alpn: Vec<Vec<u8>>,
     current: RwLock<Arc<ServerConfig>>,
 }
 
 impl TlsState {
     pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
-    pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_alpn(cert_path, key_path, vec![b"dot".to_vec()])
+    }
+
+    pub fn load_doh(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_alpn(
+            cert_path,
+            key_path,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )
+    }
+
+    pub fn load_with_alpn(
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        alpn: Vec<Vec<u8>>,
+    ) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let cert_path = cert_path.as_ref().to_path_buf();
         let key_path = key_path.as_ref().to_path_buf();
-        let config = load_server_config(&cert_path, &key_path)?;
+        let config = load_server_config(&cert_path, &key_path, alpn.clone())?;
         Ok(Self {
             cert_path,
             key_path,
-            current: RwLock::new(config),
-        })
-    }
-        let cert_path = cert_path.as_ref().to_path_buf();
-        let key_path = key_path.as_ref().to_path_buf();
-        let config = load_server_config(&cert_path, &key_path)?;
-        Ok(Self {
-            cert_path,
-            key_path,
+            alpn,
             current: RwLock::new(config),
         })
     }
@@ -63,16 +71,19 @@ impl TlsState {
     }
 
     pub fn reload(&self) -> Result<()> {
-        let config = load_server_config(&self.cert_path, &self.key_path)?;
+        let config = load_server_config(&self.cert_path, &self.key_path, self.alpn.clone())?;
         *self.current.write().expect("tls state lock poisoned") = config;
         Ok(())
     }
 }
 
-pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
-    use rustls::pki_types::CertificateDer;
-
+pub fn load_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: Vec<Vec<u8>>,
+) -> Result<Arc<ServerConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    use rustls::pki_types::CertificateDer;
 
     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
         .with_context(|| format!("failed to open certificate {}", cert_path.display()))?
@@ -100,7 +111,7 @@ pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<Serve
             )
         })?;
 
-    config.alpn_protocols = vec![b"dot".to_vec()];
+    config.alpn_protocols = alpn;
 
     Ok(Arc::new(config))
 }

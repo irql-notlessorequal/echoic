@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Echoic</title>
+  <link rel="stylesheet" href="/assets/landing.css">
+</head>
+<body>
+  <h1>Echoic</h1>
+  <p>Recursive DNS resolver with DNSSEC.</p>
+  <h2>DoH</h2>
+  <p>Endpoint: <code>https://{{ hostname }}/dns-query</code></p>
+  <pre>curl -sS -H 'accept: application/dns-message' --data-binary @query.bin https://{{ hostname }}/dns-query</pre>
+  <h2>DoT</h2>
+  <p>Use TLS on port 853 with ALPN <code>dot</code>.</p>
+  <h2>Requests served</h2>
+  <table>
+    <tr><th>Protocol</th><th>Requests</th></tr>
+    <tr><td>UDP</td><td>{{ udp }}</td></tr>
+    <tr><td>TCP</td><td>{{ tcp }}</td></tr>
+    <tr><td>DoT</td><td>{{ dot }}</td></tr>
+    <tr><td>DoH</td><td>{{ doh }}</td></tr>
+    <tr><td>Total</td><td>{{ total }}</td></tr>
+  </table>
+</body>
+</html>

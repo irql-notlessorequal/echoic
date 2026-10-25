@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 pub mod dot;
+pub mod doh;
 pub mod plain;
 
 pub use crate::dot as dot_transport;

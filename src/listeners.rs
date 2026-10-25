@@ -13,6 +13,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+pub use crate::doh::start_doh_listener;
 pub use crate::dot::start_dot_listener;
 
 use std::net::SocketAddr;
