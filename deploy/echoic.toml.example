@@ -90,3 +90,7 @@ shutdown_grace = "10s"
 [blocklist]
 # rpz_paths = ["/etc/echoic/block.rpz"]
 # rpz_origin = "rpz.local."
+
+[landing_page]
+# html = "/etc/echoic/landing.html"
+# css = "/etc/echoic/landing.css"

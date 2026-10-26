@@ -219,3 +219,163 @@ async fn doh_http_endpoints() {
 
     stop(child);
 }
+
+fn start_server_with_landing(html: &str, css: &str) -> (Child, u16) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+
+    let html_path = dir.path().join("landing.html");
+    let css_path = dir.path().join("landing.css");
+    std::fs::write(&html_path, html).expect("write html");
+    std::fs::write(&css_path, css).expect("write css");
+
+    let config_path = dir.path().join("echoic.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[logging]
+level = "info"
+
+[dnssec]
+enabled = false
+
+[[tls]]
+name = "public"
+cert = "{}"
+key = "{}"
+
+[[listeners]]
+name = "doh"
+protocol = "doh"
+address = "127.0.0.1:0"
+tls = "public"
+hostname = "localhost"
+limits = {{ max_connections = 8, max_concurrent_requests = 8 }}
+
+[server_limits]
+max_doh_body = 1024
+max_doh_uri = 1024
+query_timeout = "5s"
+idle_timeout = "5s"
+
+[landing_page]
+html = "{}"
+css = "{}"
+"#,
+            cert_path.display(),
+            key_path.display(),
+            html_path.display(),
+            css_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = echoic()
+        .args(["--config"])
+        .arg(&config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run echoic");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = sender.send(line);
+        }
+    });
+
+    let mut port = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(line) if line.contains("listener started") => {
+                if let Some(addr) = line
+                    .split("\"address\":\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    && let Ok(parsed) = addr.parse::<std::net::SocketAddr>()
+                {
+                    port = Some(parsed.port());
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let port = port.expect("listener address");
+
+    std::mem::forget(dir);
+    (child, port)
+}
+
+#[tokio::test]
+async fn custom_landing_page() {
+    let (child, port) = start_server_with_landing(
+        "<!DOCTYPE html><html><body><h1>{{ hostname }}</h1><p>{{cache_hit_rate}}</p></body></html>",
+        "body { color: rgb(1,2,3); }",
+    );
+    let base = format!("https://localhost:{}", port);
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sk")
+        .arg("--resolve")
+        .arg(format!("localhost:{}:127.0.0.1", port));
+    cmd.arg("-H").arg("Host: localhost");
+    cmd.arg(format!("{}/", base));
+    let output = cmd.output().expect("curl");
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(body.contains("localhost"), "body: {}", body);
+    assert!(body.contains("0.0%"), "body: {}", body);
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sk")
+        .arg("--resolve")
+        .arg(format!("localhost:{}:127.0.0.1", port));
+    cmd.arg("-H").arg("Host: localhost");
+    cmd.arg(format!("{}/assets/landing.css", base));
+    let output = cmd.output().expect("curl");
+    let css = String::from_utf8_lossy(&output.stdout);
+    assert!(css.contains("rgb(1,2,3)"), "css: {}", css);
+
+    stop(child);
+}
+
+#[tokio::test]
+async fn landing_page_rejects_bad_host() {
+    let (child, port) = start_server();
+    let base = format!("https://localhost:{}", port);
+
+    for path in ["/", "/assets/landing.css"] {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-sk")
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-w")
+            .arg("%{http_code}");
+        cmd.arg("--resolve")
+            .arg(format!("localhost:{}:127.0.0.1", port));
+        cmd.arg("-H").arg("Host: example.com");
+        cmd.arg(format!("{}{}", base, path));
+        let output = cmd.output().expect("curl");
+        let code: i32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(code, 400, "path {}", path);
+    }
+
+    stop(child);
+}

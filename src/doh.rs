@@ -54,6 +54,8 @@ pub struct DohRuntimeState {
     pub max_doh_body: usize,
     pub max_doh_uri: usize,
     pub concurrency: Arc<Semaphore>,
+    pub landing_html: Option<String>,
+    pub landing_css: Option<String>,
 }
 
 #[derive(Clone)]
@@ -106,6 +108,8 @@ pub async fn start_doh_listener(
     max_doh_body: usize,
     max_doh_uri: usize,
     hostname: String,
+    landing_html: Option<String>,
+    landing_css: Option<String>,
     ready: Arc<AtomicBool>,
     _handshake_timeout: Duration,
     _query_timeout: Duration,
@@ -124,6 +128,8 @@ pub async fn start_doh_listener(
         max_doh_body,
         max_doh_uri,
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
+        landing_html: landing_html.clone(),
+        landing_css: landing_css.clone(),
     }));
 
     let socket = tokio::net::TcpListener::bind(listener.address)
@@ -161,7 +167,7 @@ pub async fn start_doh_listener(
     let app = Router::new()
         .route("/dns-query", get(dns_query).post(dns_query))
         .route("/", get(landing))
-        .route("/assets/landing.css", get(landing_css))
+        .route("/assets/landing.css", get(landing_stylesheet))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(state)
@@ -404,8 +410,12 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
     }
 
     let snapshot = state.service.stats().snapshot();
-    let html = format!(
-        r#"<!DOCTYPE html>
+    let hostname = runtime.hostname.clone();
+    let html = if let Some(template) = &runtime.landing_html {
+        render_landing_template(template, &hostname, &snapshot)
+    } else {
+        format!(
+            r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -437,45 +447,101 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
   </table>
 </body>
 </html>"#,
-        hostname = state.runtime.load().hostname.clone(),
-        udp = snapshot.udp,
-        tcp = snapshot.tcp,
-        dot = snapshot.dot,
-        doh = snapshot.doh,
-        total = snapshot.total,
-        blocked = snapshot.blocked,
-        cache_hit_rate = {
-            let cache_total = snapshot.cache_hits + snapshot.cache_misses;
-            if cache_total == 0 {
-                "0.0%".to_owned()
-            } else {
-                format!(
-                    "{:.1}%",
-                    snapshot.cache_hits as f64 / cache_total as f64 * 100.0
-                )
-            }
-        },
-    );
+            hostname = hostname,
+            udp = snapshot.udp,
+            tcp = snapshot.tcp,
+            dot = snapshot.dot,
+            doh = snapshot.doh,
+            total = snapshot.total,
+            blocked = snapshot.blocked,
+            cache_hit_rate = cache_hit_rate(&snapshot),
+        )
+    };
     let mut response = Html(html).into_response();
     add_security_headers(&mut response);
     response
 }
 
-async fn landing_css(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    let _ = state;
+async fn landing_stylesheet(
+    State(state): State<DohState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
     let runtime = state.runtime.load();
     if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
         return status.into_response();
     }
+    let body = runtime
+        .landing_css
+        .clone()
+        .unwrap_or_else(|| include_str!("../assets/landing.css").to_owned());
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/css; charset=utf-8")
-        .body(axum::body::Body::from(include_str!(
-            "../assets/landing.css"
-        )))
+        .body(axum::body::Body::from(body))
         .unwrap();
     add_security_headers(&mut response);
     response
+}
+
+fn cache_hit_rate(snapshot: &crate::stats::StatsSnapshot) -> String {
+    let cache_total = snapshot.cache_hits + snapshot.cache_misses;
+    if cache_total == 0 {
+        "0.0%".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            snapshot.cache_hits as f64 / cache_total as f64 * 100.0
+        )
+    }
+}
+
+fn render_landing_template(
+    template: &str,
+    hostname: &str,
+    snapshot: &crate::stats::StatsSnapshot,
+) -> String {
+    let cache_hit_rate = cache_hit_rate(snapshot);
+    let values = [
+        ("hostname", hostname.to_owned()),
+        ("udp", snapshot.udp.to_string()),
+        ("tcp", snapshot.tcp.to_string()),
+        ("dot", snapshot.dot.to_string()),
+        ("doh", snapshot.doh.to_string()),
+        ("total", snapshot.total.to_string()),
+        ("acl_denied", snapshot.acl_denied.to_string()),
+        ("rate_limited", snapshot.rate_limited.to_string()),
+        ("overloaded", snapshot.overloaded.to_string()),
+        ("servfail", snapshot.servfail.to_string()),
+        ("blocked", snapshot.blocked.to_string()),
+        ("cache_hits", snapshot.cache_hits.to_string()),
+        ("cache_misses", snapshot.cache_misses.to_string()),
+        ("cache_hit_rate", cache_hit_rate),
+    ];
+
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find("}}") {
+            let raw = &after[..end];
+            let key = raw.trim();
+            if let Some((_, value)) = values.iter().find(|(name, _)| *name == key) {
+                rendered.push_str(value);
+            } else {
+                rendered.push_str("{{");
+                rendered.push_str(raw);
+                rendered.push_str("}}");
+            }
+            rest = &after[end + 2..];
+        } else {
+            rendered.push_str(&rest[start..]);
+            rest = "";
+        }
+    }
+    rendered.push_str(rest);
+    rendered
 }
 
 async fn healthz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
@@ -658,5 +724,25 @@ where
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));
         self.inner.call(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Protocol;
+    use crate::stats::Stats;
+
+    #[test]
+    fn landing_template_replaces_placeholders() {
+        let stats = Stats::default();
+        stats.record(Protocol::Udp);
+        let snapshot = stats.snapshot();
+        let rendered = render_landing_template(
+            "{{hostname}} {{  udp  }} {{cache_hit_rate}} {{blocked}} {{unknown}}",
+            "example.com",
+            &snapshot,
+        );
+        assert_eq!(rendered, "example.com 1 0.0% 0 {{unknown}}");
     }
 }

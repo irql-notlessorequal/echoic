@@ -80,6 +80,8 @@ pub struct Config {
     pub blocklist: BlocklistConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub landing_page: LandingPageConfig,
 }
 
 impl Config {
@@ -126,6 +128,12 @@ impl Config {
         for path in &mut self.blocklist.rpz_paths {
             *path = resolve_path(base, path);
         }
+        if let Some(path) = &mut self.landing_page.html {
+            *path = resolve_path(base, path);
+        }
+        if let Some(path) = &mut self.landing_page.css {
+            *path = resolve_path(base, path);
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -144,6 +152,7 @@ impl Config {
         self.validate_policy(&mut errors);
         self.validate_blocklist(&mut errors);
         self.validate_cache(&mut errors);
+        self.validate_landing_page(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -407,6 +416,45 @@ impl Config {
             errors.push("cache.stale_ttl must be greater than zero".to_owned());
         }
     }
+    fn validate_landing_page(&self, errors: &mut Vec<String>) {
+        const MAX_LANDING_PAGE_BYTES: usize = 1_048_576;
+        for (label, path) in [
+            ("html", &self.landing_page.html),
+            ("css", &self.landing_page.css),
+        ] {
+            if let Some(path) = path {
+                if let Ok(metadata) = fs::metadata(path)
+                    && metadata.len() > MAX_LANDING_PAGE_BYTES as u64
+                {
+                    errors.push(format!(
+                        "landing_page.{} is larger than {} bytes",
+                        label, MAX_LANDING_PAGE_BYTES
+                    ));
+                    continue;
+                }
+                match fs::read_to_string(path) {
+                    Ok(contents) if contents.trim().is_empty() => {
+                        errors.push(format!("landing_page.{} must not be empty", label));
+                    }
+                    Ok(contents) if contents.len() > MAX_LANDING_PAGE_BYTES => {
+                        errors.push(format!(
+                            "landing_page.{} is larger than {} bytes",
+                            label, MAX_LANDING_PAGE_BYTES
+                        ));
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "landing_page.{} {}: {}",
+                            label,
+                            path.display(),
+                            error
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
 
     fn validate_server_limits(&self, errors: &mut Vec<String>) {
         if !(512..=4096).contains(&self.server_limits.max_udp_payload) {
@@ -657,6 +705,36 @@ impl Default for PolicyConfig {
             edns_client_subnet_v4_prefix: None,
             edns_client_subnet_v6_prefix: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingPageConfig {
+    #[serde(default)]
+    pub html: Option<PathBuf>,
+    #[serde(default)]
+    pub css: Option<PathBuf>,
+}
+
+impl LandingPageConfig {
+    fn read_optional(path: &Option<PathBuf>) -> Result<Option<String>, ConfigError> {
+        path.as_ref()
+            .map(|path| {
+                fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn read_html(&self) -> Result<Option<String>, ConfigError> {
+        Self::read_optional(&self.html)
+    }
+
+    pub fn read_css(&self) -> Result<Option<String>, ConfigError> {
+        Self::read_optional(&self.css)
     }
 }
 
@@ -1206,5 +1284,66 @@ hostname = "dns.example.com"
                 max_concurrent_requests: Some(DEFAULT_MAX_DOH_CONCURRENT_REQUESTS),
             }
         );
+    }
+
+    #[test]
+    fn accepts_landing_page_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let html_path = dir.path().join("landing.html");
+        let css_path = dir.path().join("landing.css");
+        fs::write(&html_path, "<html>{{hostname}}</html>").expect("write html");
+        fs::write(&css_path, "body {}").expect("write css");
+
+        let config = format!(
+            "{}\n[landing_page]\nhtml = \"{}\"\ncss = \"{}\"\n",
+            MINIMAL_CONFIG,
+            html_path.display(),
+            css_path.display()
+        );
+        Config::from_toml_str(&config).expect("landing page files should be valid");
+    }
+
+    #[test]
+    fn rejects_empty_landing_page_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let html_path = dir.path().join("landing.html");
+        fs::write(&html_path, "   ").expect("write html");
+
+        let config = format!(
+            "{}\n[landing_page]\nhtml = \"{}\"\n",
+            MINIMAL_CONFIG,
+            html_path.display()
+        );
+        let error = Config::from_toml_str(&config).expect_err("empty file should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("landing_page.html must not be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_landing_page_file() {
+        let config = format!(
+            "{}\n[landing_page]\nhtml = \"/definitely/missing/landing.html\"\n",
+            MINIMAL_CONFIG
+        );
+        let error = Config::from_toml_str(&config).expect_err("missing file should be rejected");
+        assert!(error.to_string().contains("landing_page.html"));
+    }
+
+    #[test]
+    fn rejects_non_utf8_landing_page_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let html_path = dir.path().join("landing.html");
+        fs::write(&html_path, [0xff_u8]).expect("write html");
+
+        let config = format!(
+            "{}\n[landing_page]\nhtml = \"{}\"\n",
+            MINIMAL_CONFIG,
+            html_path.display()
+        );
+        let error = Config::from_toml_str(&config).expect_err("invalid UTF-8 should be rejected");
+        assert!(error.to_string().contains("landing_page.html"));
     }
 }

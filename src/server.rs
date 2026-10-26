@@ -168,6 +168,14 @@ pub async fn run_with_logging(
                 .effective(listener.protocol)
                 .max_concurrent_requests
                 .unwrap_or(128) as usize;
+            let landing_html = config
+                .landing_page
+                .read_html()
+                .with_context(|| "failed to read landing page HTML")?;
+            let landing_css = config
+                .landing_page
+                .read_css()
+                .with_context(|| "failed to read landing page CSS")?;
             match start_doh_listener(
                 listener,
                 service,
@@ -176,6 +184,8 @@ pub async fn run_with_logging(
                 config.server_limits.max_doh_body,
                 config.server_limits.max_doh_uri,
                 listener.hostname.clone().expect("validated hostname"),
+                landing_html,
+                landing_css,
                 ready.clone(),
                 config.server_limits.query_timeout,
                 config.server_limits.query_timeout,
@@ -540,12 +550,28 @@ async fn reload_once(
 
         let doh_runtime = if new_listener.protocol == Protocol::Doh {
             let max_concurrent_requests = limits.max_concurrent_requests.unwrap_or(128) as usize;
+            let landing_html = match new_config.landing_page.read_html() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to read landing page HTML during reload; using default");
+                    None
+                }
+            };
+            let landing_css = match new_config.landing_page.read_css() {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to read landing page CSS during reload; using default");
+                    None
+                }
+            };
             Some(Arc::new(ArcSwap::from_pointee(DohRuntimeState {
                 hostname: new_listener.hostname.clone().unwrap_or_default(),
                 max_concurrent_requests,
                 max_doh_body: new_config.server_limits.max_doh_body,
                 max_doh_uri: new_config.server_limits.max_doh_uri,
                 concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
+                landing_html,
+                landing_css,
             })))
         } else {
             None
