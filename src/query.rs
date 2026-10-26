@@ -27,6 +27,7 @@ use hickory_server::proto::op::{
     Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode,
 };
 use hickory_server::proto::rr::rdata::SOA;
+use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_server::proto::rr::{DNSClass, Record, RecordType};
 use hickory_server::resolver::recursor::RecursorError;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -47,6 +48,7 @@ pub struct ListenerQueryState {
     pub query_timeout: Duration,
     pub idle_timeout: Duration,
     pub query_names: bool,
+    pub edns_padding_block_size: usize,
 }
 
 pub struct QueryService {
@@ -77,6 +79,7 @@ impl QueryService {
             query_timeout: server_limits.query_timeout,
             idle_timeout: server_limits.idle_timeout,
             query_names,
+            edns_padding_block_size: listener.edns_padding_block_size(),
         };
 
         Self {
@@ -121,6 +124,10 @@ impl QueryService {
         self.state.load().query_names
     }
 
+    pub fn edns_padding_block_size(&self) -> usize {
+        self.state.load().edns_padding_block_size
+    }
+
     pub fn max_udp_payload(&self) -> u16 {
         self.state.load().max_udp_payload
     }
@@ -163,7 +170,32 @@ impl QueryService {
         metadata.recursion_available = true;
         metadata.response_code = response_code;
 
-        let edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(request, self.max_udp_payload());
+        if let Some(edns) = &mut edns {
+            edns.options_mut().remove(EdnsCode::Padding);
+        }
+        let measurement =
+            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
+        let mut measurement_bytes = Vec::with_capacity(512);
+        let mut measurement_encoder =
+            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+        let _ = measurement.destructive_emit(&mut measurement_encoder);
+        let base_len = measurement_bytes.len();
+
+        let block_size = self.edns_padding_block_size();
+        if block_size != 0
+            && let Some(request_edns) = request.edns.as_ref()
+            && request_edns.option(EdnsCode::Padding).is_some()
+            && let Some(edns) = &mut edns
+        {
+            edns.options_mut().remove(EdnsCode::Padding);
+            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            edns.options_mut().insert(EdnsOption::Unknown(
+                EdnsCode::Padding.into(),
+                vec![0; pad_len],
+            ));
+        }
+
         let response =
             MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
 
@@ -211,7 +243,37 @@ impl QueryService {
             )
             && message_is_secure(&message);
 
-        let edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(request, self.max_udp_payload());
+        if let Some(edns) = &mut edns {
+            edns.options_mut().remove(EdnsCode::Padding);
+        }
+        let measurement = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
+            metadata,
+            &message.answers,
+            &message.authorities,
+            iter::empty::<&Record>(),
+            &message.additionals,
+        );
+        let mut measurement_bytes = Vec::with_capacity(512);
+        let mut measurement_encoder =
+            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+        let _ = measurement.destructive_emit(&mut measurement_encoder);
+        let base_len = measurement_bytes.len();
+
+        let block_size = self.edns_padding_block_size();
+        if block_size != 0
+            && let Some(request_edns) = request.edns.as_ref()
+            && request_edns.option(EdnsCode::Padding).is_some()
+            && let Some(edns) = &mut edns
+        {
+            edns.options_mut().remove(EdnsCode::Padding);
+            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            edns.options_mut().insert(EdnsOption::Unknown(
+                EdnsCode::Padding.into(),
+                vec![0; pad_len],
+            ));
+        }
+
         let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
             metadata,
             &message.answers,
@@ -255,7 +317,37 @@ impl QueryService {
         metadata.response_code = response_code;
         metadata.authentic_data = authentic_data;
 
-        let edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(request, self.max_udp_payload());
+        if let Some(edns) = &mut edns {
+            edns.options_mut().remove(EdnsCode::Padding);
+        }
+        let measurement = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
+            metadata,
+            iter::empty::<&Record>(),
+            authorities.iter(),
+            soa.iter(),
+            iter::empty::<&Record>(),
+        );
+        let mut measurement_bytes = Vec::with_capacity(512);
+        let mut measurement_encoder =
+            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+        let _ = measurement.destructive_emit(&mut measurement_encoder);
+        let base_len = measurement_bytes.len();
+
+        let block_size = self.edns_padding_block_size();
+        if block_size != 0
+            && let Some(request_edns) = request.edns.as_ref()
+            && request_edns.option(EdnsCode::Padding).is_some()
+            && let Some(edns) = &mut edns
+        {
+            edns.options_mut().remove(EdnsCode::Padding);
+            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            edns.options_mut().insert(EdnsOption::Unknown(
+                EdnsCode::Padding.into(),
+                vec![0; pad_len],
+            ));
+        }
+
         let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
             metadata,
             iter::empty::<&Record>(),

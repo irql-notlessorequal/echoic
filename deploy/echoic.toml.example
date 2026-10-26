@@ -16,6 +16,7 @@ protocol = "udp"
 address = "192.168.1.10:53"
 acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
 limits = { qps = 100, burst = 200 }
+edns_padding_block_size = 128
 
 [[listeners]]
 name = "lan-tcp"
@@ -23,6 +24,7 @@ protocol = "tcp"
 address = "192.168.1.10:53"
 acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
 limits = { qps = 100, burst = 200, max_connections = 512 }
+edns_padding_block_size = 128
 
 [[listeners]]
 name = "public-dot"
@@ -30,6 +32,7 @@ protocol = "dot"
 address = "0.0.0.0:853"
 tls = "public"
 limits = { qps = 50, burst = 100, max_connections = 512 }
+edns_padding_block_size = 128
 
 [[listeners]]
 name = "public-doh"
@@ -38,6 +41,7 @@ address = "0.0.0.0:443"
 tls = "public"
 hostname = "dns.example.com"
 limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests = 128 }
+edns_padding_block_size = 128
 
 [recursor]
 # Omit root_hints to use the embedded root hints file.

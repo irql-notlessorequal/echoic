@@ -27,6 +27,7 @@ use echoic::recursor::RecursiveResolver;
 use echoic::stats::Stats;
 use hickory_server::proto::dnssec::Proof;
 use hickory_server::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_server::proto::rr::rdata::{A, SOA};
 use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_server::resolver::recursor::{AuthorityData, RecursorError};
@@ -520,6 +521,47 @@ async fn overload_drops_udp_queries_and_counts_them() {
     let snapshot = server.stats.snapshot();
     assert_eq!(snapshot.overloaded, 1);
     assert_eq!(snapshot.udp, 0);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn edns_padding_pads_response_to_block_size() {
+    let server = start(Protocol::Udp, false).await;
+    let address = server.runtime.bound_address;
+
+    let mut request = Message::query();
+    request.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    let mut edns = Edns::new();
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(EdnsCode::Padding.into(), vec![0; 8]));
+    request.set_edns(edns);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    socket
+        .send_to(&request.to_vec().expect("encode query"), address)
+        .await
+        .expect("send query");
+
+    let mut buffer = [0; 4096];
+    let (length, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .expect("query timed out")
+        .expect("receive response");
+
+    let response = Message::from_vec(&buffer[..length]).expect("decode response");
+    assert_eq!(length % 128, 0);
+    assert!(
+        response
+            .edns
+            .as_ref()
+            .expect("response edns")
+            .option(EdnsCode::Padding)
+            .is_some()
+    );
 
     server.stop().await;
 }

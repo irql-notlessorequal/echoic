@@ -282,6 +282,15 @@ impl Config {
             }
 
             validate_listener_limits(listener, errors);
+            if let Some(value) = listener.edns_padding_block_size
+                && value != 0
+                && !(16..=4096).contains(&value)
+            {
+                errors.push(format!(
+                    "listener {:?}: edns_padding_block_size must be 0 or between 16 and 4096",
+                    listener.name
+                ));
+            }
         }
     }
 
@@ -609,6 +618,14 @@ pub struct ListenerConfig {
     pub tls: Option<String>,
     #[serde(default)]
     pub hostname: Option<String>,
+    #[serde(default)]
+    pub edns_padding_block_size: Option<usize>,
+}
+
+impl ListenerConfig {
+    pub fn edns_padding_block_size(&self) -> usize {
+        self.edns_padding_block_size.unwrap_or(128)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

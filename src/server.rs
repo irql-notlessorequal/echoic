@@ -438,6 +438,7 @@ async fn reload_once(
             query_timeout: new_config.server_limits.query_timeout,
             idle_timeout: new_config.server_limits.idle_timeout,
             query_names: new_config.logging.query_names,
+            edns_padding_block_size: new_listener.edns_padding_block_size(),
         };
         let query_state = Arc::new(state);
 
