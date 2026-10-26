@@ -116,6 +116,7 @@ limits = { max_connections = 8 }
         false,
         config.policy.edns_client_subnet_v4_prefix,
         config.policy.edns_client_subnet_v6_prefix,
+        echoic::rpz::RpzPolicy::empty(),
     );
 
     let runtime = start_dot_listener(

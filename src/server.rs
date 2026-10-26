@@ -34,6 +34,7 @@ use crate::listeners::{ListenerRuntime, start_listener};
 use crate::query::{ListenerQueryState, QueryService};
 use crate::rate_limit::{KeyedRateLimiter, keyed_limiter};
 use crate::recursor::{RecursorHandle, build_recursor};
+use crate::rpz::RpzPolicy;
 use crate::stats::Stats;
 use crate::tls::TlsState;
 
@@ -86,6 +87,11 @@ pub async fn run_with_logging(
     let inflight_store = Arc::new(ArcSwap::from_pointee(inflight));
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let blocklist = RpzPolicy::load(
+        &config.blocklist.rpz_paths,
+        config.blocklist.rpz_origin.as_deref(),
+    )?;
+
     let mut runtimes: Vec<ListenerRuntime> = Vec::new();
     for listener in &config.listeners {
         let service = QueryService::new(
@@ -98,6 +104,7 @@ pub async fn run_with_logging(
             config.logging.query_names,
             config.policy.edns_client_subnet_v4_prefix,
             config.policy.edns_client_subnet_v6_prefix,
+            blocklist.clone(),
         );
 
         let runtime = if listener.protocol == Protocol::Dot {
@@ -397,6 +404,11 @@ async fn reload_once(
         None
     };
 
+    let new_blocklist = RpzPolicy::load(
+        &new_config.blocklist.rpz_paths,
+        new_config.blocklist.rpz_origin.as_deref(),
+    )?;
+
     let mut new_tls_states = HashMap::new();
     for tls in &new_config.tls {
         new_tls_states.insert(
@@ -443,6 +455,7 @@ async fn reload_once(
             edns_padding_block_size: new_listener.edns_padding_block_size(),
             client_subnet_v4_prefix: new_config.policy.edns_client_subnet_v4_prefix,
             client_subnet_v6_prefix: new_config.policy.edns_client_subnet_v6_prefix,
+            blocklist: new_blocklist.clone(),
         };
         let query_state = Arc::new(state);
 
@@ -640,6 +653,9 @@ fn watched_paths(config: &Config, config_path: &Path) -> HashSet<PathBuf> {
         paths.insert(path.clone());
     }
     if let Some(path) = &config.dnssec.trust_anchor {
+        paths.insert(path.clone());
+    }
+    for path in &config.blocklist.rpz_paths {
         paths.insert(path.clone());
     }
     paths

@@ -147,6 +147,11 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
     let listener = &config.listeners[0];
     let mock = Arc::new(MockResolver::new(validating));
     let stats = Arc::new(Stats::default());
+    let blocklist = echoic::rpz::RpzPolicy::load(
+        &config.blocklist.rpz_paths,
+        config.blocklist.rpz_origin.as_deref(),
+    )
+    .expect("rpz policy");
     let service = QueryService::new(
         mock.clone(),
         listener,
@@ -157,6 +162,7 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
         config.logging.query_names,
         config.policy.edns_client_subnet_v4_prefix,
         config.policy.edns_client_subnet_v6_prefix,
+        blocklist,
     );
     let runtime = start_listener(listener, service, config.server_limits.query_timeout)
         .await
@@ -680,6 +686,346 @@ async fn ecs_is_stripped_when_disabled() {
             .expect("response edns")
             .option(EdnsCode::Subnet)
             .is_none()
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_filters_and_redirects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+$ORIGIN rpz.local.
+ 300
+@ SOA localhost. root.localhost. 1 1h 15m 30d 2h
+  NS localhost.
+blocked.example.com CNAME .
+*.ads.example.com CNAME .
+redirect.example.com CNAME target.example.com.
+local.example.com A 127.0.0.1
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut blocked = Message::query();
+    blocked.metadata.recursion_desired = true;
+    blocked.add_query(Query::query(
+        Name::from_ascii("blocked.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    blocked.set_edns(Edns::new());
+    let response = udp_query(address, blocked).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+
+    let mut wildcard = Message::query();
+    wildcard.metadata.recursion_desired = true;
+    wildcard.add_query(Query::query(
+        Name::from_ascii("foo.bar.ads.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    wildcard.set_edns(Edns::new());
+    let response = udp_query(address, wildcard).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+
+    let mut redirect = Message::query();
+    redirect.metadata.recursion_desired = true;
+    redirect.add_query(Query::query(
+        Name::from_ascii("redirect.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    redirect.set_edns(Edns::new());
+    let response = udp_query(address, redirect).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::CNAME)
+    );
+
+    let mut local = Message::query();
+    local.metadata.recursion_desired = true;
+    local.add_query(Query::query(
+        Name::from_ascii("local.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    local.set_edns(Edns::new());
+    let response = udp_query(address, local).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.answers.iter().any(|record| {
+        record.record_type() == RecordType::A && record.name.to_string() == "local.example.com."
+    }));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_wildcard_does_not_match_partial_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+$ORIGIN rpz.local.
+$TTL 300
+@ SOA localhost. root.localhost. 1 1h 15m 30d 2h
+  NS localhost.
+*.example.com CNAME .
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut blocked = Message::query();
+    blocked.metadata.recursion_desired = true;
+    blocked.add_query(Query::query(
+        Name::from_ascii("bar.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    blocked.set_edns(Edns::new());
+    let response = udp_query(address, blocked).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+
+    let mut allowed = Message::query();
+    allowed.metadata.recursion_desired = true;
+    allowed.add_query(Query::query(
+        Name::from_ascii("fooexample.com.").expect("name"),
+        RecordType::A,
+    ));
+    allowed.set_edns(Edns::new());
+    let response = udp_query(address, allowed).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(!response.answers.is_empty());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_preserves_redirect_ttl() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+$ORIGIN rpz.local.
+$TTL 300
+@ SOA localhost. root.localhost. 1 1h 15m 30d 2h
+  NS localhost.
+redirect.example.com 600 CNAME target.example.com.
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut query_message = Message::query();
+    query_message.metadata.recursion_desired = true;
+    query_message.add_query(Query::query(
+        Name::from_ascii("redirect.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    query_message.set_edns(Edns::new());
+    let response = udp_query(address, query_message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    let cname = response
+        .answers
+        .iter()
+        .find(|record| record.record_type() == RecordType::CNAME)
+        .expect("cname");
+    assert_eq!(cname.ttl, 600);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_apex_trigger_uses_local_data() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+$ORIGIN rpz.local.
+$TTL 300
+@ SOA localhost. root.localhost. 1 1h 15m 30d 2h
+  NS localhost.
+@ A 127.0.0.1
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut query_message = Message::query();
+    query_message.metadata.recursion_desired = true;
+    query_message.add_query(Query::query(Name::root(), RecordType::A));
+    query_message.set_edns(Edns::new());
+    let response = udp_query(address, query_message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.answers.iter().any(|record| {
+        record.record_type() == RecordType::A && record.data.to_string() == "127.0.0.1"
+    }));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_configured_origin_works() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+ 300
+rpz.local. SOA localhost. root.localhost. 1 1h 15m 30d 2h
+rpz.local. NS localhost.
+redirect.example.com.rpz.local. 600 CNAME target.example.com.
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[blocklist]
+rpz_paths = ["{}"]
+rpz_origin = "rpz.local."
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut query_message = Message::query();
+    query_message.metadata.recursion_desired = true;
+    query_message.add_query(Query::query(
+        Name::from_ascii("redirect.example.com.").expect("name"),
+        RecordType::A,
+    ));
+    query_message.set_edns(Edns::new());
+    let response = udp_query(address, query_message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::CNAME)
     );
 
     server.stop().await;

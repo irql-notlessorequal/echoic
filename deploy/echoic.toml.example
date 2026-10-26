@@ -46,10 +46,10 @@ limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests
 edns_padding_block_size = 128
 
 [recursor]
-# Omit root_hints to use the embedded root hints file.
+## Omit root_hints to use the embedded root hints file.
 # root_hints = "/etc/echoic/root.hints"
 # deny_server and allow_server accept CIDR lists.
-# Omit deny_server to use Hickory's recommended special-use filters.
+## Omit deny_server to use Hickory's recommended special-use filters.
 # deny_server = ["127.0.0.0/8", "::1/128"]
 # allow_server = []
 # deny_answers = []
@@ -63,7 +63,7 @@ edns_payload_len = 1232
 
 [dnssec]
 enabled = true
-# Omit trust_anchor to use Hickory's built-in root trust anchor.
+## Omit trust_anchor to use Hickory's built-in root trust anchor.
 # trust_anchor = "/etc/echoic/root.key"
 nsec3_soft_iteration_limit = 150
 nsec3_hard_iteration_limit = 500
@@ -77,3 +77,7 @@ max_inflight_queries = 2048
 query_timeout = "10s"
 idle_timeout = "10s"
 shutdown_grace = "10s"
+
+[blocklist]
+# rpz_paths = ["/etc/echoic/block.rpz"]
+# rpz_origin = "rpz.local."

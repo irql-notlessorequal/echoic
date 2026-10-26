@@ -72,6 +72,8 @@ pub struct Config {
     pub dnssec: DnssecConfig,
     #[serde(default)]
     pub server_limits: ServerLimits,
+    #[serde(default)]
+    pub blocklist: BlocklistConfig,
 }
 
 impl Config {
@@ -115,6 +117,9 @@ impl Config {
         if let Some(path) = &mut self.dnssec.trust_anchor {
             *path = resolve_path(base, path);
         }
+        for path in &mut self.blocklist.rpz_paths {
+            *path = resolve_path(base, path);
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -131,6 +136,7 @@ impl Config {
         self.validate_dnssec(&mut errors);
         self.validate_server_limits(&mut errors);
         self.validate_policy(&mut errors);
+        self.validate_blocklist(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -363,6 +369,17 @@ impl Config {
             && !(1..=128).contains(&prefix)
         {
             errors.push("policy.edns_client_subnet_v6_prefix must be between 1 and 128".to_owned());
+        }
+    }
+
+    fn validate_blocklist(&self, errors: &mut Vec<String>) {
+        if let Some(origin) = &self.blocklist.rpz_origin
+            && origin
+                .parse::<hickory_server::proto::rr::Name>()
+                .map(|name| !name.is_fqdn())
+                .unwrap_or(true)
+        {
+            errors.push("blocklist.rpz_origin must be a fully qualified domain name".to_owned());
         }
     }
 
@@ -728,6 +745,15 @@ impl Default for DnssecConfig {
             validation_cache_size: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BlocklistConfig {
+    #[serde(default)]
+    pub rpz_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub rpz_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

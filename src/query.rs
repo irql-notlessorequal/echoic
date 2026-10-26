@@ -28,7 +28,7 @@ use hickory_server::proto::op::{
 };
 use hickory_server::proto::rr::rdata::SOA;
 use hickory_server::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
-use hickory_server::proto::rr::{DNSClass, Record, RecordType};
+use hickory_server::proto::rr::{DNSClass, Name, Record, RecordType};
 use hickory_server::resolver::recursor::RecursorError;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::{MessageResponseBuilder, Queries};
@@ -51,6 +51,7 @@ pub struct ListenerQueryState {
     pub edns_padding_block_size: usize,
     pub client_subnet_v4_prefix: Option<u8>,
     pub client_subnet_v6_prefix: Option<u8>,
+    pub blocklist: Arc<crate::rpz::RpzPolicy>,
 }
 
 pub struct QueryService {
@@ -74,6 +75,7 @@ impl QueryService {
         query_names: bool,
         client_subnet_v4_prefix: Option<u8>,
         client_subnet_v6_prefix: Option<u8>,
+        blocklist: Arc<crate::rpz::RpzPolicy>,
     ) -> Self {
         let limits = listener.limits.effective(listener.protocol);
         let state = ListenerQueryState {
@@ -87,6 +89,7 @@ impl QueryService {
             edns_padding_block_size: listener.edns_padding_block_size(),
             client_subnet_v4_prefix,
             client_subnet_v6_prefix,
+            blocklist,
         };
 
         Self {
@@ -141,6 +144,10 @@ impl QueryService {
 
     pub fn client_subnet_v6_prefix(&self) -> Option<u8> {
         self.state.load().client_subnet_v6_prefix
+    }
+
+    pub fn blocklist(&self) -> Arc<crate::rpz::RpzPolicy> {
+        self.state.load().blocklist.clone()
     }
 
     pub fn max_udp_payload(&self) -> u16 {
@@ -545,6 +552,128 @@ impl QueryService {
         }
     }
 
+    async fn send_status_truncated<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        response_code: ResponseCode,
+        started: Instant,
+    ) -> ResponseInfo {
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        metadata.response_code = response_code;
+        metadata.truncation = true;
+
+        let edns = response_edns(
+            request,
+            self.max_udp_payload(),
+            self.protocol,
+            self.idle_timeout(),
+            self.client_subnet_v4_prefix(),
+            self.client_subnet_v6_prefix(),
+        );
+        let response =
+            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
+
+        match response_handle.send_response(response).await {
+            Ok(info) => {
+                self.record_response(request, response_code, started, false);
+                info
+            }
+            Err(error) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "failed to send DNS response"
+                );
+                drop_response(request)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_rpz_redirect<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        query: &hickory_server::proto::op::Query,
+        target: Name,
+        ttl: u32,
+        started: Instant,
+        dnssec_ok: bool,
+    ) -> ResponseInfo {
+        let target_query =
+            hickory_server::proto::op::Query::query(target.clone(), query.query_type());
+        let target_response = match tokio::time::timeout(
+            self.query_timeout(),
+            self.resolver().resolve(target_query, dnssec_ok),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            _ => {
+                return self
+                    .send_status(request, response_handle, ResponseCode::ServFail, started)
+                    .await;
+            }
+        };
+
+        let mut message =
+            hickory_server::proto::op::Message::response(request.metadata.id, OpCode::Query);
+        message.add_query(query.clone());
+        message.metadata.recursion_available = true;
+        message.metadata.response_code = target_response.metadata.response_code;
+
+        let cname = Record::from_rdata(
+            query.name().clone(),
+            ttl,
+            hickory_server::proto::rr::RData::CNAME(hickory_server::proto::rr::rdata::CNAME(
+                target,
+            )),
+        );
+        message.add_answer(cname);
+        for record in &target_response.answers {
+            message.add_answer(record.clone());
+        }
+
+        self.send_message(request, response_handle, message, started)
+            .await
+    }
+
+    async fn send_rpz_local_data<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        query: &hickory_server::proto::op::Query,
+        records: Vec<Record>,
+        started: Instant,
+        _dnssec_ok: bool,
+    ) -> ResponseInfo {
+        let matching: Vec<Record> = records
+            .into_iter()
+            .filter(|record| record.record_type() == query.query_type())
+            .map(|record| Record::from_rdata(query.name().clone(), record.ttl, record.data.clone()))
+            .collect();
+
+        if matching.is_empty() {
+            return self
+                .send_status(request, response_handle, ResponseCode::NoError, started)
+                .await;
+        }
+
+        let mut message =
+            hickory_server::proto::op::Message::response(request.metadata.id, OpCode::Query);
+        message.add_query(query.clone());
+        message.metadata.recursion_available = true;
+        message.metadata.response_code = ResponseCode::NoError;
+        for record in matching {
+            message.add_answer(record);
+        }
+
+        self.send_message(request, response_handle, message, started)
+            .await
+    }
+
     fn record_response(
         &self,
         request: &Request,
@@ -688,6 +817,73 @@ impl QueryService {
             .as_ref()
             .is_some_and(|edns| edns.flags().dnssec_ok);
         let query = lower_query.original().clone();
+
+        if let Some(action) = self.blocklist().evaluate(lower_query.name()) {
+            match action {
+                crate::rpz::RpzAction::Passthru => {}
+                crate::rpz::RpzAction::Nxdomain => {
+                    self.stats.record_blocked();
+                    return self
+                        .send_status(request, response_handle, ResponseCode::NXDomain, started)
+                        .await;
+                }
+                crate::rpz::RpzAction::Nodata => {
+                    self.stats.record_blocked();
+                    return self
+                        .send_status(request, response_handle, ResponseCode::NoError, started)
+                        .await;
+                }
+                crate::rpz::RpzAction::Drop => {
+                    self.stats.record_blocked();
+                    if self.protocol == Protocol::Doh {
+                        return self
+                            .send_status(request, response_handle, ResponseCode::NoError, started)
+                            .await;
+                    }
+                    return drop_response(request);
+                }
+                crate::rpz::RpzAction::TcpOnly => {
+                    self.stats.record_blocked();
+                    if self.protocol == Protocol::Udp {
+                        return self
+                            .send_status_truncated(
+                                request,
+                                response_handle,
+                                ResponseCode::NoError,
+                                started,
+                            )
+                            .await;
+                    }
+                }
+                crate::rpz::RpzAction::Redirect(target, ttl) => {
+                    self.stats.record_blocked();
+                    return self
+                        .send_rpz_redirect(
+                            request,
+                            response_handle,
+                            &query,
+                            target.clone(),
+                            ttl,
+                            started,
+                            dnssec_ok,
+                        )
+                        .await;
+                }
+                crate::rpz::RpzAction::LocalData(records) => {
+                    self.stats.record_blocked();
+                    return self
+                        .send_rpz_local_data(
+                            request,
+                            response_handle,
+                            &query,
+                            records.clone(),
+                            started,
+                            dnssec_ok,
+                        )
+                        .await;
+                }
+            }
+        }
 
         match tokio::time::timeout(
             self.query_timeout(),

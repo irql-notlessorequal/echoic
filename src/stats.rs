@@ -27,6 +27,7 @@ pub struct Stats {
     rate_limited: AtomicU64,
     overloaded: AtomicU64,
     servfail: AtomicU64,
+    blocked: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub struct StatsSnapshot {
     pub rate_limited: u64,
     pub overloaded: u64,
     pub servfail: u64,
+    pub blocked: u64,
     pub total: u64,
 }
 
@@ -68,6 +70,10 @@ impl Stats {
         self.servfail.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_blocked(&self) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let udp = self.udp.load(Ordering::Relaxed);
         let tcp = self.tcp.load(Ordering::Relaxed);
@@ -83,6 +89,7 @@ impl Stats {
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             overloaded: self.overloaded.load(Ordering::Relaxed),
             servfail: self.servfail.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
             total: udp + tcp + dot + doh,
         }
     }
@@ -117,6 +124,7 @@ mod tests {
                 rate_limited: 1,
                 overloaded: 1,
                 servfail: 1,
+                blocked: 0,
                 total: 4,
             }
         );

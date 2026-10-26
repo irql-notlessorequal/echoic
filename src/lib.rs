@@ -22,6 +22,7 @@ pub mod listeners;
 pub mod query;
 pub mod rate_limit;
 pub mod recursor;
+pub mod rpz;
 pub mod server;
 pub mod stats;
 pub mod tls;
