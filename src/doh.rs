@@ -535,12 +535,7 @@ fn validate_host(headers: &HeaderMap, uri: &Uri, expected: &str) -> Result<(), S
     }
 
     let raw = authority.or(host_header).ok_or(StatusCode::BAD_REQUEST)?;
-    let (name, port) = split_host_port(&raw);
-    if let Some(port) = port
-        && port != "443"
-    {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let (name, _) = split_host_port(&raw);
     let name = name.strip_suffix('.').unwrap_or(name);
     if !name.eq_ignore_ascii_case(expected) {
         return Err(StatusCode::BAD_REQUEST);
@@ -549,6 +544,20 @@ fn validate_host(headers: &HeaderMap, uri: &Uri, expected: &str) -> Result<(), S
 }
 
 fn split_host_port(value: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let host = &value[..=end];
+        let remainder = &value[end + 1..];
+        if let Some(port) = remainder.strip_prefix(':')
+            && !port.is_empty()
+            && port.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return (host, Some(port));
+        }
+        return (host, None);
+    }
+
     if let Some((host, port)) = value.rsplit_once(':')
         && !host.is_empty()
         && !port.is_empty()

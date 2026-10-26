@@ -154,6 +154,14 @@ async fn doh_http_endpoints() {
     let (code, _) = run(&[&format!("{}/healthz", base), "-H", "Host: localhost"]);
     assert_eq!(code, 200);
 
+    // explicit non-default port in Host is accepted
+    let (code, _) = run(&[
+        &format!("{}/healthz", base),
+        "-H",
+        &format!("Host: localhost:{}", port),
+    ]);
+    assert_eq!(code, 200);
+
     // readyz
     let (code, _) = run(&[&format!("{}/readyz", base), "-H", "Host: localhost"]);
     assert_eq!(code, 200);
