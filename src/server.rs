@@ -83,6 +83,8 @@ pub async fn run_with_logging(
     let config_store = Arc::new(ArcSwap::from_pointee(config.clone()));
     let resolver_handle = RecursorHandle::new(build_recursor(&config)?);
     let stats = Arc::new(Stats::default());
+    metrics::set_global_recorder(crate::metrics::EchoicMetricsRecorder::new(stats.clone()))
+        .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
     let inflight = Arc::new(Semaphore::new(config.server_limits.max_inflight_queries));
     let inflight_store = Arc::new(ArcSwap::from_pointee(inflight));
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));

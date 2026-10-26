@@ -419,7 +419,8 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
   <p>Endpoint: <code>https://{hostname}/dns-query</code></p>
   <h2>DoT</h2>
   <p>Use TLS on port 853 with ALPN <code>dot</code>.</p>
-  <h2>Requests served</h2>
+  <h2>Statistics</h2>
+  <h3>Requests by protocol</h3>
   <table>
     <tr><th>Protocol</th><th>Requests</th></tr>
     <tr><td>UDP</td><td>{udp}</td></tr>
@@ -427,6 +428,12 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
     <tr><td>DoT</td><td>{dot}</td></tr>
     <tr><td>DoH</td><td>{doh}</td></tr>
     <tr><td>Total</td><td>{total}</td></tr>
+  </table>
+  <h3>Miscellaneous</h3>
+  <table>
+    <tr><th>Metric</th><th>Value</th></tr>
+    <tr><td>Blocked requests</td><td>{blocked}</td></tr>
+    <tr><td>Cache hit rate</td><td>{cache_hit_rate}</td></tr>
   </table>
 </body>
 </html>"#,
@@ -436,6 +443,18 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
         dot = snapshot.dot,
         doh = snapshot.doh,
         total = snapshot.total,
+        blocked = snapshot.blocked,
+        cache_hit_rate = {
+            let cache_total = snapshot.cache_hits + snapshot.cache_misses;
+            if cache_total == 0 {
+                "0.0%".to_owned()
+            } else {
+                format!(
+                    "{:.1}%",
+                    snapshot.cache_hits as f64 / cache_total as f64 * 100.0
+                )
+            }
+        },
     );
     let mut response = Html(html).into_response();
     add_security_headers(&mut response);

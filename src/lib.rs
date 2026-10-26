@@ -19,6 +19,7 @@ pub mod doh;
 pub mod dot;
 pub mod error;
 pub mod listeners;
+pub mod metrics;
 pub mod query;
 pub mod rate_limit;
 pub mod recursor;

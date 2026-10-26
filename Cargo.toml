@@ -21,7 +21,8 @@ governor = "0.10"
 hyper = "1.11"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 hickory-net = { version = "=0.26.3", features = ["tls-ring", "tokio"] }
-hickory-server = { version = "=0.26.3", features = ["dnssec-ring", "recursor", "tls-ring"] }
+metrics = "0.24.1"
+hickory-server = { version = "=0.26.3", features = ["dnssec-ring", "metrics", "recursor", "tls-ring"] }
 humantime-serde = "1.1"
 ipnet = { version = "2.11", features = ["serde"] }
 notify = "8.2"

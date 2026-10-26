@@ -175,7 +175,7 @@ async fn doh_http_endpoints() {
     cmd.arg(format!("{}/", base));
     let output = cmd.output().expect("curl");
     let body = String::from_utf8_lossy(&output.stdout);
-    assert!(body.contains("Requests served"), "body: {}", body);
+    assert!(body.contains("Statistics"), "body: {}", body);
 
     // missing dns
     let (code, _) = run(&[&format!("{}/dns-query", base), "-H", "Host: localhost"]);

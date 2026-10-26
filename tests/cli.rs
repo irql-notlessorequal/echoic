@@ -99,7 +99,7 @@ fn normal_startup_initializes_logging_and_starts_listeners() {
         &config_path,
         r#"
 [logging]
-level = "info"
+level = "debug"
 
 [dnssec]
 enabled = false
@@ -230,7 +230,7 @@ fn query_names_are_omitted_by_default() {
         &config_path,
         r#"
 [logging]
-level = "info"
+level = "debug"
 
 [dnssec]
 enabled = false

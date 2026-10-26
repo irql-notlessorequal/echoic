@@ -512,7 +512,7 @@ impl QueryService {
                 let elapsed_ms = started.elapsed().as_millis();
                 let query = queries.queries().first();
                 if self.query_names() {
-                    tracing::info!(
+                    tracing::debug!(
                         listener = %self.listener_name,
                         protocol = self.protocol.as_str(),
                         src = %source.ip(),
@@ -524,7 +524,7 @@ impl QueryService {
                         "query completed"
                     );
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         listener = %self.listener_name,
                         protocol = self.protocol.as_str(),
                         src = %source.ip(),
@@ -618,26 +618,25 @@ impl QueryService {
             }
         };
 
-        let mut message =
-            hickory_server::proto::op::Message::response(request.metadata.id, OpCode::Query);
-        message.add_query(query.clone());
-        message.metadata.recursion_available = true;
-        message.metadata.response_code = target_response.metadata.response_code;
-
-        let cname = Record::from_rdata(
+        let mut answers = Vec::with_capacity(target_response.answers.len() + 1);
+        answers.push(Record::from_rdata(
             query.name().clone(),
             ttl,
             hickory_server::proto::rr::RData::CNAME(hickory_server::proto::rr::rdata::CNAME(
                 target,
             )),
-        );
-        message.add_answer(cname);
-        for record in &target_response.answers {
-            message.add_answer(record.clone());
-        }
+        ));
+        answers.extend(target_response.answers.iter().cloned());
 
-        self.send_message(request, response_handle, message, started)
-            .await
+        self.send_rpz_message(
+            request,
+            response_handle,
+            query,
+            answers,
+            target_response.metadata.response_code,
+            started,
+        )
+        .await
     }
 
     async fn send_rpz_local_data<R: ResponseHandler>(
@@ -661,12 +660,32 @@ impl QueryService {
                 .await;
         }
 
+        self.send_rpz_message(
+            request,
+            response_handle,
+            query,
+            matching,
+            ResponseCode::NoError,
+            started,
+        )
+        .await
+    }
+
+    async fn send_rpz_message<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        query: &hickory_server::proto::op::Query,
+        answers: Vec<Record>,
+        response_code: ResponseCode,
+        started: Instant,
+    ) -> ResponseInfo {
         let mut message =
             hickory_server::proto::op::Message::response(request.metadata.id, OpCode::Query);
         message.add_query(query.clone());
         message.metadata.recursion_available = true;
-        message.metadata.response_code = ResponseCode::NoError;
-        for record in matching {
+        message.metadata.response_code = response_code;
+        for record in answers {
             message.add_answer(record);
         }
 
@@ -689,7 +708,7 @@ impl QueryService {
         let elapsed_ms = started.elapsed().as_millis();
         if self.query_names() {
             let query = request.queries.queries().first();
-            tracing::info!(
+            tracing::debug!(
                 listener = %self.listener_name,
                 protocol = self.protocol.as_str(),
                 src = %request.src().ip(),
@@ -702,7 +721,7 @@ impl QueryService {
             );
         } else {
             let query = request.queries.queries().first();
-            tracing::info!(
+            tracing::debug!(
                 listener = %self.listener_name,
                 protocol = self.protocol.as_str(),
                 src = %request.src().ip(),
@@ -819,22 +838,23 @@ impl QueryService {
         let query = lower_query.original().clone();
 
         if let Some(action) = self.blocklist().evaluate(lower_query.name()) {
+            if !matches!(action, crate::rpz::RpzAction::Passthru) {
+                self.stats.record_blocked();
+            }
+
             match action {
                 crate::rpz::RpzAction::Passthru => {}
                 crate::rpz::RpzAction::Nxdomain => {
-                    self.stats.record_blocked();
                     return self
                         .send_status(request, response_handle, ResponseCode::NXDomain, started)
                         .await;
                 }
                 crate::rpz::RpzAction::Nodata => {
-                    self.stats.record_blocked();
                     return self
                         .send_status(request, response_handle, ResponseCode::NoError, started)
                         .await;
                 }
                 crate::rpz::RpzAction::Drop => {
-                    self.stats.record_blocked();
                     if self.protocol == Protocol::Doh {
                         return self
                             .send_status(request, response_handle, ResponseCode::NoError, started)
@@ -843,7 +863,6 @@ impl QueryService {
                     return drop_response(request);
                 }
                 crate::rpz::RpzAction::TcpOnly => {
-                    self.stats.record_blocked();
                     if self.protocol == Protocol::Udp {
                         return self
                             .send_status_truncated(
@@ -856,7 +875,6 @@ impl QueryService {
                     }
                 }
                 crate::rpz::RpzAction::Redirect(target, ttl) => {
-                    self.stats.record_blocked();
                     return self
                         .send_rpz_redirect(
                             request,
@@ -870,7 +888,6 @@ impl QueryService {
                         .await;
                 }
                 crate::rpz::RpzAction::LocalData(records) => {
-                    self.stats.record_blocked();
                     return self
                         .send_rpz_local_data(
                             request,

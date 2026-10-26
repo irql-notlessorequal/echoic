@@ -55,6 +55,11 @@ impl RpzPolicy {
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid RPZ origin: {error}"))?;
 
+        let nodata_target = Name::from_str("*.").expect("valid RPZ NODATA target");
+        let passthru_target = Name::from_str("rpz-passthru.").expect("valid RPZ passthru target");
+        let drop_target = Name::from_str("rpz-drop.").expect("valid RPZ drop target");
+        let tcp_only_target = Name::from_str("rpz-tcp-only.").expect("valid RPZ TCP-only target");
+
         for path in paths {
             let contents = fs::read_to_string(path)
                 .with_context(|| format!("failed to read RPZ {}", path.display()))?;
@@ -106,18 +111,13 @@ impl RpzPolicy {
                 let action = if let Some(target) = cname_target {
                     if target == Name::root() {
                         RpzAction::Nxdomain
-                    } else if target == Name::from_str("*.").unwrap_or_else(|_| Name::root()) {
+                    } else if target == nodata_target {
                         RpzAction::Nodata
-                    } else if target
-                        == Name::from_str("rpz-passthru.").unwrap_or_else(|_| Name::root())
-                    {
+                    } else if target == passthru_target {
                         RpzAction::Passthru
-                    } else if target == Name::from_str("rpz-drop.").unwrap_or_else(|_| Name::root())
-                    {
+                    } else if target == drop_target {
                         RpzAction::Drop
-                    } else if target
-                        == Name::from_str("rpz-tcp-only.").unwrap_or_else(|_| Name::root())
-                    {
+                    } else if target == tcp_only_target {
                         RpzAction::TcpOnly
                     } else {
                         RpzAction::Redirect(target, cname_ttl)
