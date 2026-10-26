@@ -59,14 +59,11 @@ fn init_logging(logging: &LoggingConfig) -> anyhow::Result<ReloadHandle> {
     let mut directives = vec![logging.level.clone()];
     if logging.level != "off" {
         let hickory_level = if logging.query_names { "info" } else { "warn" };
-        for target in [
-            "hickory_server",
-            "hickory_resolver",
-            "hickory_proto",
-            "hickory_net",
-        ] {
+        for target in ["hickory_server", "hickory_proto", "hickory_net"] {
             directives.push(format!("{target}={hickory_level}"));
         }
+        let resolver_level = if logging.query_names { "info" } else { "error" };
+        directives.push(format!("hickory_resolver={resolver_level}"));
     }
 
     let filter = EnvFilter::try_new(directives.join(","))

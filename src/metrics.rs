@@ -75,12 +75,12 @@ impl Recorder for EchoicMetricsRecorder {
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        if key.name() == "hickory_resolver_cache_hit_total" {
+        if key.name() == "hickory_recursor_cache_hit_total" {
             Counter::from_arc(Arc::new(StatCounter {
                 stats: self.stats.clone(),
                 hit: true,
             }))
-        } else if key.name() == "hickory_resolver_cache_miss_total" {
+        } else if key.name() == "hickory_recursor_cache_miss_total" {
             Counter::from_arc(Arc::new(StatCounter {
                 stats: self.stats.clone(),
                 hit: false,
