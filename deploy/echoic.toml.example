@@ -69,6 +69,15 @@ nsec3_soft_iteration_limit = 150
 nsec3_hard_iteration_limit = 500
 validation_cache_size = 65536
 
+[cache]
+persistent = false
+# path = "/var/lib/echoic/cache.json"
+max_entries = 100000
+flush_interval = "60s"
+max_ttl = "3600s"
+serve_stale = false
+stale_ttl = "86400s"
+
 [server_limits]
 max_udp_payload = 1232
 max_doh_body = 65535

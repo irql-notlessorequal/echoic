@@ -20,6 +20,7 @@ pub mod dot;
 pub mod error;
 pub mod listeners;
 pub mod metrics;
+pub mod persistent_cache;
 pub mod query;
 pub mod rate_limit;
 pub mod recursor;

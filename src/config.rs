@@ -45,6 +45,10 @@ const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 2_048;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const DEFAULT_CACHE_MAX_ENTRIES: u64 = 100_000;
+const DEFAULT_CACHE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_CACHE_MAX_TTL: Duration = Duration::from_secs(3_600);
+const DEFAULT_CACHE_STALE_TTL: Duration = Duration::from_secs(86_400);
 
 const PRIVATE_NETWORKS: &[&str] = &[
     "127.0.0.0/8",
@@ -74,6 +78,8 @@ pub struct Config {
     pub server_limits: ServerLimits,
     #[serde(default)]
     pub blocklist: BlocklistConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 impl Config {
@@ -137,6 +143,7 @@ impl Config {
         self.validate_server_limits(&mut errors);
         self.validate_policy(&mut errors);
         self.validate_blocklist(&mut errors);
+        self.validate_cache(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -380,6 +387,24 @@ impl Config {
                 .unwrap_or(true)
         {
             errors.push("blocklist.rpz_origin must be a fully qualified domain name".to_owned());
+        }
+    }
+
+    fn validate_cache(&self, errors: &mut Vec<String>) {
+        if self.cache.persistent && self.cache.path.is_none() {
+            errors.push("cache.path is required when cache.persistent is true".to_owned());
+        }
+        if self.cache.max_entries == 0 {
+            errors.push("cache.max_entries must be greater than zero".to_owned());
+        }
+        if self.cache.flush_interval.is_zero() {
+            errors.push("cache.flush_interval must be greater than zero".to_owned());
+        }
+        if self.cache.max_ttl.is_zero() {
+            errors.push("cache.max_ttl must be greater than zero".to_owned());
+        }
+        if self.cache.stale_ttl.is_zero() {
+            errors.push("cache.stale_ttl must be greater than zero".to_owned());
         }
     }
 
@@ -747,6 +772,39 @@ impl Default for DnssecConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub persistent: bool,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+    #[serde(default = "default_cache_flush_interval", with = "humantime_serde")]
+    pub flush_interval: Duration,
+    #[serde(default = "default_cache_max_ttl", with = "humantime_serde")]
+    pub max_ttl: Duration,
+    #[serde(default)]
+    pub serve_stale: bool,
+    #[serde(default = "default_cache_stale_ttl", with = "humantime_serde")]
+    pub stale_ttl: Duration,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            persistent: false,
+            path: None,
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+            flush_interval: DEFAULT_CACHE_FLUSH_INTERVAL,
+            max_ttl: DEFAULT_CACHE_MAX_TTL,
+            serve_stale: false,
+            stale_ttl: DEFAULT_CACHE_STALE_TTL,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BlocklistConfig {
@@ -791,6 +849,22 @@ impl Default for ServerLimits {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_cache_max_entries() -> u64 {
+    DEFAULT_CACHE_MAX_ENTRIES
+}
+
+fn default_cache_flush_interval() -> Duration {
+    DEFAULT_CACHE_FLUSH_INTERVAL
+}
+
+fn default_cache_max_ttl() -> Duration {
+    DEFAULT_CACHE_MAX_TTL
+}
+
+fn default_cache_stale_ttl() -> Duration {
+    DEFAULT_CACHE_STALE_TTL
 }
 
 fn default_response_cache_size() -> u64 {

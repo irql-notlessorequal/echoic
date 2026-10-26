@@ -31,9 +31,10 @@ use crate::config::{Config, Protocol};
 use crate::doh::{DohRuntimeState, start_doh_listener};
 use crate::dot::start_dot_listener;
 use crate::listeners::{ListenerRuntime, start_listener};
+use crate::persistent_cache::PersistentDnsCache;
 use crate::query::{ListenerQueryState, QueryService};
 use crate::rate_limit::{KeyedRateLimiter, keyed_limiter};
-use crate::recursor::{RecursorHandle, build_recursor};
+use crate::recursor::{CachedRecursiveResolver, RecursorHandle, build_recursor};
 use crate::rpz::RpzPolicy;
 use crate::stats::Stats;
 use crate::tls::TlsState;
@@ -52,6 +53,7 @@ struct ReloadContext {
     config: Arc<ArcSwap<Config>>,
     config_path: Option<PathBuf>,
     resolver: RecursorHandle,
+    cache_handle: Arc<ArcSwap<Option<Arc<PersistentDnsCache>>>>,
     inflight: Arc<ArcSwap<Arc<Semaphore>>>,
     runtimes: Arc<Mutex<Vec<ListenerRuntime>>>,
     logging_reload: Option<ReloadHandle>,
@@ -81,7 +83,19 @@ pub async fn run_with_logging(
     install_ring_provider();
 
     let config_store = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let resolver_handle = RecursorHandle::new(build_recursor(&config)?);
+    let cache_handle = Arc::new(ArcSwap::from_pointee(
+        if config.cache.persistent || config.cache.serve_stale {
+            Some(Arc::new(PersistentDnsCache::new(&config.cache)))
+        } else {
+            None
+        },
+    ));
+    let base_resolver = build_recursor(&config)?;
+    let cached_resolver = Arc::new(CachedRecursiveResolver::new(
+        base_resolver,
+        cache_handle.clone(),
+    ));
+    let resolver_handle = RecursorHandle::new(cached_resolver);
     let stats = Arc::new(Stats::default());
     metrics::set_global_recorder(crate::metrics::EchoicMetricsRecorder::new(stats.clone()))
         .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
@@ -207,6 +221,25 @@ pub async fn run_with_logging(
     let cleanup_token = CancellationToken::new();
     let cleanup_task = spawn_rate_limiter_cleanup(cleanup_token.clone(), limiters.clone());
 
+    let cache_flush_token = CancellationToken::new();
+    let cache_flush_task = tokio::spawn({
+        let token = cache_flush_token.clone();
+        let config_store = config_store.clone();
+        let cache_handle = cache_handle.clone();
+        async move {
+            loop {
+                let delay = config_store.load().cache.flush_interval;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                if let Some(cache) = cache_handle.load_full().as_deref() {
+                    cache.flush();
+                }
+            }
+        }
+    });
+
     let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
     let watched_paths = config_path
         .as_ref()
@@ -241,6 +274,7 @@ pub async fn run_with_logging(
         config: config_store.clone(),
         config_path: config_path.clone(),
         resolver: resolver_handle.clone(),
+        cache_handle: cache_handle.clone(),
         inflight: inflight_store.clone(),
         runtimes: runtimes.clone(),
         logging_reload: logging_reload.clone(),
@@ -268,6 +302,12 @@ pub async fn run_with_logging(
     cleanup_token.cancel();
     cleanup_task.abort();
     let _ = cleanup_task.await;
+    cache_flush_token.cancel();
+    cache_flush_task.abort();
+    let _ = cache_flush_task.await;
+    if let Some(cache) = cache_handle.load_full().as_deref() {
+        cache.flush();
+    }
     reload_task.abort();
     let _ = reload_task.await;
     if let Some(task) = sighup_task {
@@ -399,9 +439,32 @@ async fn reload_once(
     let new_config = Config::load(config_path)?;
     let new_filter = build_filter(&new_config)?;
 
-    let recursor_changed = recursor_signature(&current_config) != recursor_signature(&new_config);
+    let recursor_settings_changed =
+        recursor_signature(&current_config) != recursor_signature(&new_config);
+    let cache_changed = current_config.cache != new_config.cache;
+    let recursor_changed = recursor_settings_changed || cache_changed;
+
+    if (cache_changed || recursor_settings_changed)
+        && let Some(cache) = ctx.cache_handle.load_full().as_deref()
+    {
+        cache.clear();
+    }
+
+    if cache_changed {
+        let new_cache = if new_config.cache.persistent || new_config.cache.serve_stale {
+            Some(Arc::new(PersistentDnsCache::new(&new_config.cache)))
+        } else {
+            None
+        };
+        ctx.cache_handle.store(Arc::new(new_cache));
+    }
+
     let new_resolver = if recursor_changed {
-        Some(build_recursor(&new_config)?)
+        let base = build_recursor(&new_config)?;
+        Some(Arc::new(CachedRecursiveResolver::new(
+            base,
+            ctx.cache_handle.clone(),
+        )))
     } else {
         None
     };

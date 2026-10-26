@@ -44,6 +44,7 @@ enum ExtendedDnsError {
     DnssecBogus,
     Blocked,
     Filtered,
+    StaleAnswer,
 }
 
 impl ExtendedDnsError {
@@ -52,6 +53,7 @@ impl ExtendedDnsError {
             Self::DnssecBogus => 6,
             Self::Blocked => 15,
             Self::Filtered => 17,
+            Self::StaleAnswer => 3,
         }
     }
 
@@ -60,6 +62,7 @@ impl ExtendedDnsError {
             Self::DnssecBogus => "DNSSEC validation failed",
             Self::Blocked => "Blocked",
             Self::Filtered => "Filtered",
+            Self::StaleAnswer => "Stale Answer",
         }
     }
 
@@ -1039,13 +1042,27 @@ impl QueryService {
 
         match tokio::time::timeout(
             self.query_timeout(),
-            self.resolver().resolve(query, dnssec_ok),
+            self.resolver().resolve_cached(query.clone(), dnssec_ok),
         )
         .await
         {
-            Ok(Ok(message)) => {
-                self.send_message(request, response_handle, message, None, started)
-                    .await
+            Ok(Ok(resolved)) => {
+                if resolved.cache_hit {
+                    self.stats.record_cache_hit(1);
+                }
+                let extended_error = if resolved.stale {
+                    Some(ExtendedDnsError::StaleAnswer)
+                } else {
+                    None
+                };
+                self.send_message(
+                    request,
+                    response_handle,
+                    resolved.message,
+                    extended_error,
+                    started,
+                )
+                .await
             }
             Ok(Err(error)) => {
                 self.handle_recursor_error(request, response_handle, error, started)
@@ -1057,6 +1074,22 @@ impl QueryService {
                     timeout_ms = self.query_timeout().as_millis(),
                     "query timed out"
                 );
+                if let Some(message) = self
+                    .resolver()
+                    .stale_cached_response(query.clone(), dnssec_ok)
+                    .await
+                {
+                    self.stats.record_cache_hit(1);
+                    return self
+                        .send_message(
+                            request,
+                            response_handle,
+                            message,
+                            Some(ExtendedDnsError::StaleAnswer),
+                            started,
+                        )
+                        .await;
+                }
                 self.send_status(
                     request,
                     response_handle,

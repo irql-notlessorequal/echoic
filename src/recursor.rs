@@ -24,6 +24,7 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use hickory_server::net::runtime::TokioRuntimeProvider;
+use hickory_server::net::{DnsError, NetError};
 use hickory_server::proto::dnssec::TrustAnchors;
 use hickory_server::proto::op::{Message, Query};
 use hickory_server::proto::rr::{Name, RData, RecordSet};
@@ -39,9 +40,34 @@ use crate::config::{Config, QNameMinimization as ConfigQNameMinimization};
 const EMBEDDED_ROOT_HINTS: &str = include_str!("../assets/root.hints");
 const EMBEDDED_ROOT_HINTS_NAME: &str = "assets/root.hints";
 
+#[derive(Debug)]
+pub struct ResolvedResponse {
+    pub message: Message,
+    pub stale: bool,
+    pub cache_hit: bool,
+}
+
 #[async_trait]
 pub trait RecursiveResolver: Send + Sync {
     async fn resolve(&self, query: Query, dnssec_ok: bool) -> Result<Message, RecursorError>;
+
+    async fn resolve_cached(
+        &self,
+        query: Query,
+        dnssec_ok: bool,
+    ) -> Result<ResolvedResponse, RecursorError> {
+        self.resolve(query, dnssec_ok)
+            .await
+            .map(|message| ResolvedResponse {
+                message,
+                stale: false,
+                cache_hit: false,
+            })
+    }
+
+    async fn stale_cached_response(&self, _query: Query, _dnssec_ok: bool) -> Option<Message> {
+        None
+    }
 
     fn is_validating(&self) -> bool;
 }
@@ -80,6 +106,120 @@ impl RecursorHandle {
     pub fn is_validating(&self) -> bool {
         self.current().is_validating()
     }
+}
+
+pub struct CachedRecursiveResolver {
+    inner: Arc<dyn RecursiveResolver>,
+    cache: Arc<arc_swap::ArcSwap<Option<Arc<crate::persistent_cache::PersistentDnsCache>>>>,
+}
+
+impl CachedRecursiveResolver {
+    pub fn new(
+        inner: Arc<dyn RecursiveResolver>,
+        cache: Arc<arc_swap::ArcSwap<Option<Arc<crate::persistent_cache::PersistentDnsCache>>>>,
+    ) -> Self {
+        Self { inner, cache }
+    }
+}
+
+#[async_trait]
+impl RecursiveResolver for CachedRecursiveResolver {
+    async fn resolve(&self, query: Query, dnssec_ok: bool) -> Result<Message, RecursorError> {
+        self.resolve_cached(query, dnssec_ok)
+            .await
+            .map(|response| response.message)
+    }
+
+    async fn resolve_cached(
+        &self,
+        query: Query,
+        dnssec_ok: bool,
+    ) -> Result<ResolvedResponse, RecursorError> {
+        use crate::persistent_cache::CacheKey;
+        use std::time::SystemTime;
+
+        let cache = self.cache.load_full();
+        let Some(cache) = cache.as_ref() else {
+            return self
+                .inner
+                .resolve(query.clone(), dnssec_ok)
+                .await
+                .map(|message| ResolvedResponse {
+                    message,
+                    stale: false,
+                    cache_hit: false,
+                });
+        };
+
+        let key = CacheKey {
+            name: query.name().clone().to_lowercase(),
+            qtype: query.query_type(),
+            qclass: query.query_class(),
+            dnssec_ok,
+        };
+
+        let now = SystemTime::now();
+        if let Some((message, false)) = cache.get(&key, now) {
+            return Ok(ResolvedResponse {
+                message,
+                stale: false,
+                cache_hit: true,
+            });
+        }
+
+        match self.inner.resolve(query.clone(), dnssec_ok).await {
+            Ok(message) => {
+                cache.insert(key, message.clone(), now);
+                Ok(ResolvedResponse {
+                    message,
+                    stale: false,
+                    cache_hit: false,
+                })
+            }
+            Err(error) if cache.config().serve_stale && !is_negative_recursor_error(&error) => {
+                if let Some((message, true)) = cache.get(&key, now) {
+                    return Ok(ResolvedResponse {
+                        message,
+                        stale: true,
+                        cache_hit: true,
+                    });
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn stale_cached_response(&self, query: Query, _dnssec_ok: bool) -> Option<Message> {
+        use crate::persistent_cache::CacheKey;
+        use std::time::SystemTime;
+
+        let loaded = self.cache.load_full();
+        let Some(cache) = loaded.as_ref() else {
+            return None;
+        };
+        let key = CacheKey {
+            name: query.name().clone().to_lowercase(),
+            qtype: query.query_type(),
+            qclass: query.query_class(),
+            dnssec_ok: _dnssec_ok,
+        };
+        let now = SystemTime::now();
+        cache
+            .get(&key, now)
+            .and_then(|(message, stale)| if stale { Some(message) } else { None })
+    }
+
+    fn is_validating(&self) -> bool {
+        self.inner.is_validating()
+    }
+}
+
+fn is_negative_recursor_error(error: &RecursorError) -> bool {
+    matches!(
+        error,
+        RecursorError::Negative(_) | RecursorError::Net(NetError::Dns(DnsError::NoRecordsFound(_)))
+    )
 }
 
 pub fn build_recursor(config: &Config) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
