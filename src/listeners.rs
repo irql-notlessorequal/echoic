@@ -18,6 +18,8 @@ pub use crate::dot::start_dot_listener;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -28,8 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ListenerConfig, Protocol};
-use crate::query::QueryService;
-use crate::rate_limit::KeyedRateLimiter;
+use crate::query::{ListenerQueryState, QueryService};
 
 const TCP_RESPONSE_BUFFER_SIZE: usize = 32;
 
@@ -39,7 +40,11 @@ pub struct ListenerRuntime {
     pub address: SocketAddr,
     pub bound_address: SocketAddr,
     pub token: CancellationToken,
-    pub rate_limiter: Arc<KeyedRateLimiter>,
+    pub query_state: Arc<ArcSwap<ListenerQueryState>>,
+    pub tls_state: Arc<ArcSwap<Option<Arc<crate::tls::TlsState>>>>,
+    pub dot_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
+    pub doh_runtime: Option<Arc<ArcSwap<crate::doh::DohRuntimeState>>>,
+    pub doh_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
     pub task: JoinHandle<Result<(), NetError>>,
 }
 
@@ -48,7 +53,7 @@ pub async fn start_listener(
     service: QueryService,
     request_timeout: Duration,
 ) -> anyhow::Result<ListenerRuntime> {
-    let rate_limiter = service.rate_limiter();
+    let query_state = service.state();
     let mut server = Server::new(service);
     let token = server.shutdown_token().clone();
 
@@ -109,7 +114,11 @@ pub async fn start_listener(
         address: listener.address,
         bound_address,
         token,
-        rate_limiter,
+        query_state,
+        tls_state: Arc::new(ArcSwap::from_pointee(None)),
+        dot_max_connections: None,
+        doh_runtime: None,
+        doh_max_connections: None,
         task,
     })
 }

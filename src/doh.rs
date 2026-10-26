@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
@@ -38,7 +40,6 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tower_http::timeout::TimeoutLayer;
 
 use crate::config::{ListenerConfig, Protocol};
 use crate::listeners::ListenerRuntime;
@@ -47,11 +48,18 @@ use crate::rate_limit::RateKey;
 use crate::tls::TlsState;
 
 #[derive(Clone)]
-pub struct DohState {
-    pub service: Arc<QueryService>,
+pub struct DohRuntimeState {
     pub hostname: String,
+    pub max_concurrent_requests: usize,
+    pub max_doh_body: usize,
     pub max_doh_uri: usize,
     pub concurrency: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct DohState {
+    pub service: Arc<QueryService>,
+    pub runtime: Arc<ArcSwap<DohRuntimeState>>,
     pub ready: Arc<AtomicBool>,
 }
 
@@ -87,6 +95,8 @@ const URL_SAFE_OPTIONAL_PAD: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
+const MAX_DOH_BODY_LIMIT: usize = 65535;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn start_doh_listener(
     listener: &ListenerConfig,
@@ -97,8 +107,8 @@ pub async fn start_doh_listener(
     max_doh_uri: usize,
     hostname: String,
     ready: Arc<AtomicBool>,
-    handshake_timeout: Duration,
-    query_timeout: Duration,
+    _handshake_timeout: Duration,
+    _query_timeout: Duration,
 ) -> anyhow::Result<ListenerRuntime> {
     let max_connections = listener
         .limits
@@ -106,9 +116,15 @@ pub async fn start_doh_listener(
         .max_connections
         .unwrap_or(512) as usize;
 
-    let rate_limiter = service.rate_limiter();
+    let query_state = service.state();
     let service = Arc::new(service);
-    let concurrency = Arc::new(Semaphore::new(max_concurrent_requests));
+    let doh_runtime = Arc::new(ArcSwap::from_pointee(DohRuntimeState {
+        hostname: hostname.clone(),
+        max_concurrent_requests,
+        max_doh_body,
+        max_doh_uri,
+        concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
+    }));
 
     let socket = tokio::net::TcpListener::bind(listener.address)
         .await
@@ -138,9 +154,7 @@ pub async fn start_doh_listener(
 
     let state = DohState {
         service: service.clone(),
-        hostname: hostname.clone(),
-        max_doh_uri,
-        concurrency: concurrency.clone(),
+        runtime: doh_runtime.clone(),
         ready: ready.clone(),
     };
 
@@ -151,17 +165,19 @@ pub async fn start_doh_listener(
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(max_doh_body))
-        .layer(axum::middleware::from_fn(security_headers))
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            query_timeout,
-        ));
+        .layer(DefaultBodyLimit::max(MAX_DOH_BODY_LIMIT))
+        .layer(axum::middleware::from_fn(security_headers));
 
     let token = CancellationToken::new();
     let task_token = token.clone();
-    let tls_for_task = tls_state.clone();
-    let semaphore_for_task = Arc::new(Semaphore::new(max_connections));
+    let tls_state_swap = Arc::new(ArcSwap::from_pointee(Some(tls_state.clone())));
+    let tls_state_for_task = tls_state_swap.clone();
+    let max_connections_state = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
+        max_connections,
+    ))));
+    let max_connections_state_for_task = max_connections_state.clone();
+    let service_for_task = service.clone();
+    let doh_runtime_for_task = doh_runtime.clone();
     let listener_name = listener.name.clone();
     let app_for_task = app.clone();
 
@@ -179,7 +195,8 @@ pub async fn start_doh_listener(
                         }
                     };
 
-                    let permit = match semaphore_for_task.clone().try_acquire_owned() {
+                    let semaphore = max_connections_state_for_task.load();
+                    let permit = match semaphore.as_ref().clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
                             tracing::debug!(listener = %listener_name, src = %src_addr, "DoH connection cap reached");
@@ -188,10 +205,14 @@ pub async fn start_doh_listener(
                         }
                     };
 
-                    let tls_state = tls_for_task.clone();
+                    let tls_state = tls_state_for_task.load();
+                    let tls_state = tls_state.as_ref().clone().expect("tls state");
+                    let service = service_for_task.clone();
+                    let handshake_timeout = service.query_timeout();
                     let token = task_token.clone();
                     let app = app_for_task.clone();
-                    let max_streams = max_concurrent_requests as u32;
+                    let doh_runtime = doh_runtime_for_task.clone();
+                    let max_streams = doh_runtime.load().max_concurrent_requests as u32;
                     connections.spawn(async move {
                         let _permit = permit;
                         let tls_stream = match tokio::time::timeout(handshake_timeout, tls_state.acceptor().accept(tcp_stream)).await {
@@ -217,13 +238,17 @@ pub async fn start_doh_listener(
                         let mut builder = AutoBuilder::new(TokioExecutor::new());
                         builder.http2().max_concurrent_streams(max_streams);
                         let conn = builder.serve_connection(io, service);
+                        tokio::pin!(conn);
                         tokio::select! {
-                            result = conn => {
+                            result = &mut conn => {
                                 if let Err(error) = result {
                                     tracing::debug!(src = %src_addr, error = %error, "DoH connection error");
                                 }
                             }
-                            _ = token.cancelled() => {}
+                            _ = token.cancelled() => {
+                                conn.as_mut().graceful_shutdown();
+                                let _ = (&mut conn).await;
+                            }
                         }
                     });
                 }
@@ -243,7 +268,11 @@ pub async fn start_doh_listener(
         address: listener.address,
         bound_address,
         token,
-        rate_limiter,
+        query_state,
+        tls_state: tls_state_swap,
+        dot_max_connections: None,
+        doh_runtime: Some(doh_runtime),
+        doh_max_connections: Some(max_connections_state),
         task,
     })
 }
@@ -256,7 +285,12 @@ async fn dns_query(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(status) = validate_host(&headers, &uri, &state.hostname) {
+    let runtime = state.runtime.load();
+    let hostname = runtime.hostname.clone();
+    let max_doh_body = runtime.max_doh_body;
+    let max_doh_uri = runtime.max_doh_uri;
+    let concurrency = runtime.concurrency.clone();
+    if let Err(status) = validate_host(&headers, &uri, &hostname) {
         return status.into_response();
     }
 
@@ -285,7 +319,7 @@ async fn dns_query(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let doh_permit = match state.concurrency.try_acquire_owned() {
+    let doh_permit = match concurrency.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             state.service.stats().record_overloaded();
@@ -300,7 +334,7 @@ async fn dns_query(
                 Some(value) => value,
                 None => return StatusCode::BAD_REQUEST.into_response(),
             };
-            match decode_dns(&value, state.max_doh_uri) {
+            match decode_dns(&value, max_doh_uri) {
                 Ok(bytes) => bytes,
                 Err(status) => return status.into_response(),
             }
@@ -311,6 +345,9 @@ async fn dns_query(
             }
             if body.is_empty() {
                 return StatusCode::BAD_REQUEST.into_response();
+            }
+            if body.len() > max_doh_body {
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
             }
             body.to_vec()
         }
@@ -327,16 +364,22 @@ async fn dns_query(
         bytes: buffer.clone(),
     };
 
-    let _info = state
-        .service
-        .handle_admitted_request::<_, hickory_net::runtime::TokioTime>(
-            &request,
-            response_handle,
-            Instant::now(),
-        )
-        .await;
+    let request_result = tokio::time::timeout(
+        state.service.query_timeout(),
+        state
+            .service
+            .handle_admitted_request::<_, hickory_net::runtime::TokioTime>(
+                &request,
+                response_handle,
+                Instant::now(),
+            ),
+    )
+    .await;
 
-    let bytes = buffer.lock().await.take().unwrap_or_default();
+    let bytes = match request_result {
+        Ok(_) => buffer.lock().await.take().unwrap_or_default(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
     if bytes.is_empty() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -355,7 +398,8 @@ async fn dns_query(
 }
 
 async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    if let Err(status) = validate_host(&headers, &uri, &state.hostname) {
+    let runtime = state.runtime.load();
+    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
         return status.into_response();
     }
 
@@ -386,7 +430,7 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
   </table>
 </body>
 </html>"#,
-        hostname = state.hostname,
+        hostname = state.runtime.load().hostname.clone(),
         udp = snapshot.udp,
         tcp = snapshot.tcp,
         dot = snapshot.dot,
@@ -400,7 +444,8 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
 
 async fn landing_css(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
     let _ = state;
-    if let Err(status) = validate_host(&headers, &uri, &state.hostname) {
+    let runtime = state.runtime.load();
+    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
         return status.into_response();
     }
     let mut response = Response::builder()
@@ -415,7 +460,8 @@ async fn landing_css(State(state): State<DohState>, uri: Uri, headers: HeaderMap
 }
 
 async fn healthz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    if let Err(status) = validate_host(&headers, &uri, &state.hostname) {
+    let runtime = state.runtime.load();
+    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
         return status.into_response();
     }
     let mut response = (StatusCode::OK, "ok\n").into_response();
@@ -428,7 +474,8 @@ async fn healthz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
 }
 
 async fn readyz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    if let Err(status) = validate_host(&headers, &uri, &state.hostname) {
+    let runtime = state.runtime.load();
+    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
         return status.into_response();
     }
     let ready = state.ready.load(Ordering::Relaxed);

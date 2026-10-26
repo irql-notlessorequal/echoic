@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use echoic::config::{Config, Protocol};
 use echoic::listeners::{ListenerRuntime, start_listener};
@@ -149,7 +150,7 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
         mock.clone(),
         listener,
         stats.clone(),
-        Arc::new(Semaphore::new(inflight)),
+        Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(inflight)))),
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,

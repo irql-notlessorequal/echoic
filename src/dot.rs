@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,8 +43,8 @@ pub async fn start_dot_listener(
     listener: &ListenerConfig,
     service: QueryService,
     tls_state: Arc<TlsState>,
-    handshake_timeout: Duration,
-    idle_timeout: Duration,
+    _handshake_timeout: Duration,
+    _idle_timeout: Duration,
 ) -> Result<ListenerRuntime> {
     let max_connections = listener
         .limits
@@ -50,7 +52,11 @@ pub async fn start_dot_listener(
         .max_connections
         .unwrap_or(512) as usize;
 
-    let rate_limiter = service.rate_limiter();
+    let query_state = service.state();
+    let max_connections_state = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
+        max_connections,
+    ))));
+    let tls_state_swap = Arc::new(ArcSwap::from_pointee(Some(tls_state.clone())));
     let service = Arc::new(service);
 
     let socket = TcpListener::bind(listener.address).await.with_context(|| {
@@ -74,11 +80,10 @@ pub async fn start_dot_listener(
     );
 
     let token = CancellationToken::new();
-    let semaphore = Arc::new(Semaphore::new(max_connections));
     let task_token = token.clone();
     let service_for_task = service.clone();
-    let tls_for_task = tls_state.clone();
-    let semaphore_for_task = semaphore.clone();
+    let tls_state_for_task = tls_state_swap.clone();
+    let max_connections_for_task = max_connections_state.clone();
     let listener_name = listener.name.clone();
 
     let task = tokio::spawn(async move {
@@ -98,7 +103,8 @@ pub async fn start_dot_listener(
                         }
                     };
 
-                    let permit = match semaphore_for_task.clone().try_acquire_owned() {
+                    let semaphore = max_connections_for_task.load();
+                    let permit = match semaphore.as_ref().clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
                             tracing::debug!(listener = %listener_name, src = %src_addr, "DoT connection cap reached");
@@ -108,7 +114,8 @@ pub async fn start_dot_listener(
                     };
 
                     let service = service_for_task.clone();
-                    let tls_state = tls_for_task.clone();
+                    let tls_state = tls_state_for_task.load();
+                    let tls_state = tls_state.as_ref().clone().expect("tls state");
                     let token = task_token.clone();
                     connections.spawn(async move {
                         let _permit = permit;
@@ -117,8 +124,8 @@ pub async fn start_dot_listener(
                             src_addr,
                             service,
                             tls_state,
-                            handshake_timeout,
-                            idle_timeout,
+                            _handshake_timeout,
+                            _idle_timeout,
                             token,
                         )
                         .await;
@@ -140,7 +147,11 @@ pub async fn start_dot_listener(
         address: listener.address,
         bound_address,
         token,
-        rate_limiter,
+        query_state,
+        tls_state: tls_state_swap,
+        dot_max_connections: Some(max_connections_state),
+        doh_max_connections: None,
+        doh_runtime: None,
         task,
     })
 }
@@ -150,12 +161,12 @@ async fn handle_connection(
     src_addr: SocketAddr,
     service: Arc<QueryService>,
     tls_state: Arc<TlsState>,
-    handshake_timeout: Duration,
-    idle_timeout: Duration,
+    _handshake_timeout: Duration,
+    _idle_timeout: Duration,
     token: CancellationToken,
 ) {
     let tls_stream = match tokio::time::timeout(
-        handshake_timeout,
+        service.query_timeout(),
         tls_state.acceptor().accept(tcp_stream),
     )
     .await
@@ -183,7 +194,7 @@ async fn handle_connection(
             break;
         }
 
-        let next = tokio::time::timeout(idle_timeout, buf_stream.next()).await;
+        let next = tokio::time::timeout(service.idle_timeout(), buf_stream.next()).await;
         let message = match next {
             Ok(Some(Ok(message))) => message,
             Ok(Some(Err(error))) => {

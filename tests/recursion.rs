@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use echoic::config::Config;
 use echoic::listeners::{ListenerRuntime, start_listener};
 use echoic::query::QueryService;
@@ -268,7 +269,7 @@ async fn start_recursion_server() -> (RecursionServer, Counters) {
         resolver,
         &config.listeners[0],
         stats.clone(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(16)))),
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,

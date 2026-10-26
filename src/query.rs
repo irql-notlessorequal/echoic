@@ -16,6 +16,8 @@
 use std::iter;
 use std::net::IpAddr;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -33,22 +35,27 @@ use tokio::sync::Semaphore;
 
 use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
 use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
-use crate::recursor::RecursiveResolver;
+use crate::recursor::{RecursiveResolver, RecursorHandle};
 use crate::stats::Stats;
 
+#[derive(Clone)]
+pub struct ListenerQueryState {
+    pub acl: Arc<AclConfig>,
+    pub rate_limiter: Arc<KeyedRateLimiter>,
+    pub refuse_any: bool,
+    pub max_udp_payload: u16,
+    pub query_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub query_names: bool,
+}
+
 pub struct QueryService {
-    resolver: Arc<dyn RecursiveResolver>,
+    resolver: RecursorHandle,
     listener_name: String,
     protocol: Protocol,
-    acl: AclConfig,
-    rate_limiter: Arc<KeyedRateLimiter>,
+    state: Arc<ArcSwap<ListenerQueryState>>,
     stats: Arc<Stats>,
-    inflight: Arc<Semaphore>,
-    query_timeout: Duration,
-    max_udp_payload: u16,
-    refuse_any: bool,
-    query_names: bool,
-    validating: bool,
+    inflight: Arc<ArcSwap<Arc<Semaphore>>>,
 }
 
 impl QueryService {
@@ -56,40 +63,74 @@ impl QueryService {
         resolver: Arc<dyn RecursiveResolver>,
         listener: &ListenerConfig,
         stats: Arc<Stats>,
-        inflight: Arc<Semaphore>,
+        inflight: Arc<ArcSwap<Arc<Semaphore>>>,
         server_limits: &ServerLimits,
         refuse_any: bool,
         query_names: bool,
     ) -> Self {
         let limits = listener.limits.effective(listener.protocol);
-        let validating = resolver.is_validating();
+        let state = ListenerQueryState {
+            acl: Arc::new(listener.acl.clone()),
+            rate_limiter: Arc::new(keyed_limiter(limits.qps, limits.burst)),
+            refuse_any,
+            max_udp_payload: server_limits.max_udp_payload,
+            query_timeout: server_limits.query_timeout,
+            idle_timeout: server_limits.idle_timeout,
+            query_names,
+        };
 
         Self {
-            resolver,
+            resolver: RecursorHandle::new(resolver),
             listener_name: listener.name.clone(),
             protocol: listener.protocol,
-            acl: listener.acl.clone(),
-            rate_limiter: Arc::new(keyed_limiter(limits.qps, limits.burst)),
+            state: Arc::new(ArcSwap::from_pointee(state)),
             stats,
             inflight,
-            query_timeout: server_limits.query_timeout,
-            max_udp_payload: server_limits.max_udp_payload,
-            refuse_any,
-            query_names,
-            validating,
         }
     }
 
     pub fn rate_limiter(&self) -> Arc<KeyedRateLimiter> {
-        self.rate_limiter.clone()
+        self.state.load().rate_limiter.clone()
     }
 
-    pub fn acl(&self) -> &AclConfig {
-        &self.acl
+    pub fn state(&self) -> Arc<ArcSwap<ListenerQueryState>> {
+        self.state.clone()
     }
 
     pub fn inflight(&self) -> Arc<Semaphore> {
-        self.inflight.clone()
+        Arc::clone(&*self.inflight.load())
+    }
+
+    pub fn acl(&self) -> Arc<AclConfig> {
+        self.state.load().acl.clone()
+    }
+
+    pub fn resolver(&self) -> Arc<dyn RecursiveResolver> {
+        self.resolver.current()
+    }
+
+    pub fn validating(&self) -> bool {
+        self.resolver().is_validating()
+    }
+
+    pub fn refuse_any(&self) -> bool {
+        self.state.load().refuse_any
+    }
+
+    pub fn query_names(&self) -> bool {
+        self.state.load().query_names
+    }
+
+    pub fn max_udp_payload(&self) -> u16 {
+        self.state.load().max_udp_payload
+    }
+
+    pub fn query_timeout(&self) -> Duration {
+        self.state.load().query_timeout
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        self.state.load().idle_timeout
     }
 
     pub fn stats(&self) -> Arc<Stats> {
@@ -122,7 +163,7 @@ impl QueryService {
         metadata.recursion_available = true;
         metadata.response_code = response_code;
 
-        let edns = response_edns(request, self.max_udp_payload);
+        let edns = response_edns(request, self.max_udp_payload());
         let response =
             MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
 
@@ -149,7 +190,7 @@ impl QueryService {
         message: hickory_server::proto::op::Message,
         started: Instant,
     ) -> ResponseInfo {
-        if self.validating && message_is_bogus(&message) {
+        if self.validating() && message_is_bogus(&message) {
             tracing::warn!(
                 listener = %self.listener_name,
                 "DNSSEC validation failed"
@@ -163,14 +204,14 @@ impl QueryService {
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = response_code;
-        metadata.authentic_data = self.validating
+        metadata.authentic_data = self.validating()
             && matches!(
                 response_code,
                 ResponseCode::NoError | ResponseCode::NXDomain
             )
             && message_is_secure(&message);
 
-        let edns = response_edns(request, self.max_udp_payload);
+        let edns = response_edns(request, self.max_udp_payload());
         let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
             metadata,
             &message.answers,
@@ -208,13 +249,13 @@ impl QueryService {
             soa,
             secure,
         } = negative;
-        let authentic_data = self.validating && secure;
+        let authentic_data = self.validating() && secure;
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = response_code;
         metadata.authentic_data = authentic_data;
 
-        let edns = response_edns(request, self.max_udp_payload);
+        let edns = response_edns(request, self.max_udp_payload());
         let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
             metadata,
             iter::empty::<&Record>(),
@@ -249,7 +290,7 @@ impl QueryService {
     ) -> ResponseInfo {
         let source_ip = normalize_ip(source.ip());
 
-        if !self.acl.is_allowed(source_ip, self.protocol) {
+        if !self.acl().is_allowed(source_ip, self.protocol) {
             self.stats.record_acl_denied();
             return self
                 .send_simple(
@@ -264,7 +305,7 @@ impl QueryService {
         }
 
         if self
-            .rate_limiter
+            .rate_limiter()
             .check_key(&RateKey::from(source_ip))
             .is_err()
         {
@@ -281,7 +322,7 @@ impl QueryService {
                 .await;
         }
 
-        let _permit = match self.inflight.try_acquire() {
+        let _permit = match self.inflight().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 self.stats.record_overloaded();
@@ -335,7 +376,7 @@ impl QueryService {
 
                 let elapsed_ms = started.elapsed().as_millis();
                 let query = queries.queries().first();
-                if self.query_names {
+                if self.query_names() {
                     tracing::info!(
                         listener = %self.listener_name,
                         protocol = self.protocol.as_str(),
@@ -389,7 +430,7 @@ impl QueryService {
         }
 
         let elapsed_ms = started.elapsed().as_millis();
-        if self.query_names {
+        if self.query_names() {
             let query = request.queries.queries().first();
             tracing::info!(
                 listener = %self.listener_name,
@@ -428,21 +469,25 @@ impl RequestHandler for QueryService {
         let started = Instant::now();
         let source = normalize_ip(request.src().ip());
 
-        if !self.acl.is_allowed(source, self.protocol) {
+        if !self.acl().is_allowed(source, self.protocol) {
             self.stats.record_acl_denied();
             return self
                 .reject(request, response_handle, ResponseCode::Refused, started)
                 .await;
         }
 
-        if self.rate_limiter.check_key(&RateKey::from(source)).is_err() {
+        if self
+            .rate_limiter()
+            .check_key(&RateKey::from(source))
+            .is_err()
+        {
             self.stats.record_rate_limited();
             return self
                 .reject(request, response_handle, ResponseCode::Refused, started)
                 .await;
         }
 
-        let _permit = match self.inflight.try_acquire() {
+        let _permit = match self.inflight().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 self.stats.record_overloaded();
@@ -504,7 +549,7 @@ impl QueryService {
                 .await;
         }
 
-        if self.refuse_any && lower_query.query_type() == RecordType::ANY {
+        if self.refuse_any() && lower_query.query_type() == RecordType::ANY {
             return self
                 .send_status(request, response_handle, ResponseCode::Refused, started)
                 .await;
@@ -516,8 +561,11 @@ impl QueryService {
             .is_some_and(|edns| edns.flags().dnssec_ok);
         let query = lower_query.original().clone();
 
-        match tokio::time::timeout(self.query_timeout, self.resolver.resolve(query, dnssec_ok))
-            .await
+        match tokio::time::timeout(
+            self.query_timeout(),
+            self.resolver().resolve(query, dnssec_ok),
+        )
+        .await
         {
             Ok(Ok(message)) => {
                 self.send_message(request, response_handle, message, started)
@@ -530,7 +578,7 @@ impl QueryService {
             Err(_) => {
                 tracing::warn!(
                     listener = %self.listener_name,
-                    timeout_ms = self.query_timeout.as_millis(),
+                    timeout_ms = self.query_timeout().as_millis(),
                     "query timed out"
                 );
                 self.send_status(request, response_handle, ResponseCode::ServFail, started)

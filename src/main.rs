@@ -18,7 +18,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use echoic::cli::Cli;
 use echoic::config::{Config, LoggingConfig};
+use echoic::server::ReloadHandle;
 use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 fn main() -> ExitCode {
     match run() {
@@ -39,15 +41,19 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    init_logging(&config.logging)?;
+    let logging_reload = init_logging(&config.logging)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("failed to build async runtime: {error}"))?;
-    runtime.block_on(echoic::server::run(config))
+    runtime.block_on(echoic::server::run_with_logging(
+        config,
+        Some(cli.config.clone()),
+        Some(logging_reload),
+    ))
 }
 
-fn init_logging(logging: &LoggingConfig) -> anyhow::Result<()> {
+fn init_logging(logging: &LoggingConfig) -> anyhow::Result<ReloadHandle> {
     logging.level_filter()?;
 
     let mut directives = vec![logging.level.clone()];
@@ -66,11 +72,15 @@ fn init_logging(logging: &LoggingConfig) -> anyhow::Result<()> {
     let filter = EnvFilter::try_new(directives.join(","))
         .map_err(|error| anyhow::anyhow!("failed to build logging filter: {error}"))?;
 
-    tracing_subscriber::fmt()
+    let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_env_filter(filter)
         .with_ansi(false)
-        .with_writer(std::io::stdout)
-        .try_init()
-        .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))
+        .with_writer(std::io::stdout);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .init();
+
+    Ok(reload_handle)
 }

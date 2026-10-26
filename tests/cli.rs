@@ -172,7 +172,7 @@ tls = "public"
         .expect("run echoic");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to load TLS"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to open certificate"));
 }
 
 fn log_lines(child: &mut Child) -> mpsc::Receiver<String> {

@@ -13,6 +13,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,7 +108,9 @@ limits = { max_connections = 8 }
         Arc::new(MockResolver),
         &listener,
         stats,
-        Arc::new(tokio::sync::Semaphore::new(8)),
+        Arc::new(ArcSwap::from_pointee(Arc::new(
+            tokio::sync::Semaphore::new(8),
+        ))),
         &config.server_limits,
         config.policy.refuse_any,
         false,

@@ -17,6 +17,8 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -52,6 +54,31 @@ impl<P: ConnectionProvider> RecursiveResolver for Recursor<P> {
 
     fn is_validating(&self) -> bool {
         Recursor::<P>::is_validating(self)
+    }
+}
+
+#[derive(Clone)]
+pub struct RecursorHandle {
+    inner: Arc<ArcSwap<Arc<dyn RecursiveResolver>>>,
+}
+
+impl RecursorHandle {
+    pub fn new(resolver: Arc<dyn RecursiveResolver>) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(resolver)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<dyn RecursiveResolver> {
+        Arc::clone(&*self.inner.load())
+    }
+
+    pub fn store(&self, resolver: Arc<dyn RecursiveResolver>) {
+        self.inner.store(Arc::new(resolver));
+    }
+
+    pub fn is_validating(&self) -> bool {
+        self.current().is_validating()
     }
 }
 

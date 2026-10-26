@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+arc-swap = "1.9"
 axum = "0.8"
 base64 = "0.22"
 futures-util = "0.3"
@@ -23,6 +24,7 @@ hickory-net = { version = "=0.26.3", features = ["tls-ring", "tokio"] }
 hickory-server = { version = "=0.26.3", features = ["dnssec-ring", "recursor", "tls-ring"] }
 humantime-serde = "1.1"
 ipnet = { version = "2.11", features = ["serde"] }
+notify = "8.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.15"
 tokio-rustls = "0.26"
