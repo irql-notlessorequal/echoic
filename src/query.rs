@@ -39,6 +39,45 @@ use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
 use crate::recursor::{RecursiveResolver, RecursorHandle};
 use crate::stats::Stats;
 
+#[derive(Clone, Copy, Debug)]
+enum ExtendedDnsError {
+    DnssecBogus,
+    Blocked,
+    Filtered,
+}
+
+impl ExtendedDnsError {
+    fn info_code(self) -> u16 {
+        match self {
+            Self::DnssecBogus => 6,
+            Self::Blocked => 15,
+            Self::Filtered => 17,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::DnssecBogus => "DNSSEC validation failed",
+            Self::Blocked => "Blocked",
+            Self::Filtered => "Filtered",
+        }
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = self.info_code().to_be_bytes().to_vec();
+        bytes.extend_from_slice(self.text().as_bytes());
+        bytes
+    }
+}
+
+fn rpz_extended_dns_error(action: &crate::rpz::RpzAction) -> Option<ExtendedDnsError> {
+    match action {
+        crate::rpz::RpzAction::Passthru => None,
+        crate::rpz::RpzAction::Nxdomain => Some(ExtendedDnsError::Filtered),
+        _ => Some(ExtendedDnsError::Blocked),
+    }
+}
+
 #[derive(Clone)]
 pub struct ListenerQueryState {
     pub acl: Arc<AclConfig>,
@@ -176,16 +215,18 @@ impl QueryService {
         if self.protocol == Protocol::Udp {
             drop_response(request)
         } else {
-            self.send_status(request, response_handle, response_code, started)
+            self.send_status(request, response_handle, response_code, None, started)
                 .await
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_status<R: ResponseHandler>(
         &self,
         request: &Request,
         mut response_handle: R,
         response_code: ResponseCode,
+        extended_error: Option<ExtendedDnsError>,
         started: Instant,
     ) -> ResponseInfo {
         let mut metadata = Metadata::response_from_request(&request.metadata);
@@ -199,6 +240,7 @@ impl QueryService {
             self.idle_timeout(),
             self.client_subnet_v4_prefix(),
             self.client_subnet_v6_prefix(),
+            extended_error,
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -244,11 +286,13 @@ impl QueryService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_message<R: ResponseHandler>(
         &self,
         request: &Request,
         mut response_handle: R,
         message: hickory_server::proto::op::Message,
+        extended_error: Option<ExtendedDnsError>,
         started: Instant,
     ) -> ResponseInfo {
         if self.validating() && message_is_bogus(&message) {
@@ -257,7 +301,13 @@ impl QueryService {
                 "DNSSEC validation failed"
             );
             return self
-                .send_status(request, response_handle, ResponseCode::ServFail, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::ServFail,
+                    Some(ExtendedDnsError::DnssecBogus),
+                    started,
+                )
                 .await;
         }
 
@@ -279,6 +329,7 @@ impl QueryService {
             self.idle_timeout(),
             self.client_subnet_v4_prefix(),
             self.client_subnet_v6_prefix(),
+            extended_error,
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -360,6 +411,7 @@ impl QueryService {
             self.idle_timeout(),
             self.client_subnet_v4_prefix(),
             self.client_subnet_v6_prefix(),
+            None,
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -552,11 +604,13 @@ impl QueryService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_status_truncated<R: ResponseHandler>(
         &self,
         request: &Request,
         mut response_handle: R,
         response_code: ResponseCode,
+        extended_error: Option<ExtendedDnsError>,
         started: Instant,
     ) -> ResponseInfo {
         let mut metadata = Metadata::response_from_request(&request.metadata);
@@ -571,6 +625,7 @@ impl QueryService {
             self.idle_timeout(),
             self.client_subnet_v4_prefix(),
             self.client_subnet_v6_prefix(),
+            extended_error,
         );
         let response =
             MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
@@ -613,7 +668,13 @@ impl QueryService {
             Ok(Ok(response)) => response,
             _ => {
                 return self
-                    .send_status(request, response_handle, ResponseCode::ServFail, started)
+                    .send_status(
+                        request,
+                        response_handle,
+                        ResponseCode::ServFail,
+                        None,
+                        started,
+                    )
                     .await;
             }
         };
@@ -656,7 +717,13 @@ impl QueryService {
 
         if matching.is_empty() {
             return self
-                .send_status(request, response_handle, ResponseCode::NoError, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::NoError,
+                    Some(ExtendedDnsError::Blocked),
+                    started,
+                )
                 .await;
         }
 
@@ -689,8 +756,14 @@ impl QueryService {
             message.add_answer(record);
         }
 
-        self.send_message(request, response_handle, message, started)
-            .await
+        self.send_message(
+            request,
+            response_handle,
+            message,
+            Some(ExtendedDnsError::Blocked),
+            started,
+        )
+        .await
     }
 
     fn record_response(
@@ -787,32 +860,62 @@ impl QueryService {
     ) -> ResponseInfo {
         if request.queries.len() != 1 {
             return self
-                .send_status(request, response_handle, ResponseCode::FormErr, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::FormErr,
+                    None,
+                    started,
+                )
                 .await;
         }
 
         if request.metadata.op_code != OpCode::Query {
             return self
-                .send_status(request, response_handle, ResponseCode::NotImp, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::NotImp,
+                    None,
+                    started,
+                )
                 .await;
         }
 
         if request.version() != 0 {
             return self
-                .send_status(request, response_handle, ResponseCode::BADVERS, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::BADVERS,
+                    None,
+                    started,
+                )
                 .await;
         }
 
         if !request.metadata.recursion_desired {
             return self
-                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::Refused,
+                    None,
+                    started,
+                )
                 .await;
         }
 
         let lower_query = &request.queries.queries()[0];
         if lower_query.query_class() != DNSClass::IN {
             return self
-                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::Refused,
+                    None,
+                    started,
+                )
                 .await;
         }
 
@@ -821,13 +924,25 @@ impl QueryService {
             RecordType::AXFR | RecordType::IXFR
         ) {
             return self
-                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::Refused,
+                    None,
+                    started,
+                )
                 .await;
         }
 
         if self.refuse_any() && lower_query.query_type() == RecordType::ANY {
             return self
-                .send_status(request, response_handle, ResponseCode::Refused, started)
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::Refused,
+                    None,
+                    started,
+                )
                 .await;
         }
 
@@ -838,7 +953,8 @@ impl QueryService {
         let query = lower_query.original().clone();
 
         if let Some(action) = self.blocklist().evaluate(lower_query.name()) {
-            if !matches!(action, crate::rpz::RpzAction::Passthru) {
+            let extended_error = rpz_extended_dns_error(&action);
+            if extended_error.is_some() {
                 self.stats.record_blocked();
             }
 
@@ -846,18 +962,36 @@ impl QueryService {
                 crate::rpz::RpzAction::Passthru => {}
                 crate::rpz::RpzAction::Nxdomain => {
                     return self
-                        .send_status(request, response_handle, ResponseCode::NXDomain, started)
+                        .send_status(
+                            request,
+                            response_handle,
+                            ResponseCode::NXDomain,
+                            extended_error,
+                            started,
+                        )
                         .await;
                 }
                 crate::rpz::RpzAction::Nodata => {
                     return self
-                        .send_status(request, response_handle, ResponseCode::NoError, started)
+                        .send_status(
+                            request,
+                            response_handle,
+                            ResponseCode::NoError,
+                            extended_error,
+                            started,
+                        )
                         .await;
                 }
                 crate::rpz::RpzAction::Drop => {
                     if self.protocol == Protocol::Doh {
                         return self
-                            .send_status(request, response_handle, ResponseCode::NoError, started)
+                            .send_status(
+                                request,
+                                response_handle,
+                                ResponseCode::NoError,
+                                extended_error,
+                                started,
+                            )
                             .await;
                     }
                     return drop_response(request);
@@ -869,6 +1003,7 @@ impl QueryService {
                                 request,
                                 response_handle,
                                 ResponseCode::NoError,
+                                extended_error,
                                 started,
                             )
                             .await;
@@ -909,7 +1044,7 @@ impl QueryService {
         .await
         {
             Ok(Ok(message)) => {
-                self.send_message(request, response_handle, message, started)
+                self.send_message(request, response_handle, message, None, started)
                     .await
             }
             Ok(Err(error)) => {
@@ -922,8 +1057,14 @@ impl QueryService {
                     timeout_ms = self.query_timeout().as_millis(),
                     "query timed out"
                 );
-                self.send_status(request, response_handle, ResponseCode::ServFail, started)
-                    .await
+                self.send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::ServFail,
+                    None,
+                    started,
+                )
+                .await
             }
         }
     }
@@ -946,8 +1087,14 @@ impl QueryService {
             error = %error,
             "recursive query failed"
         );
-        self.send_status(request, response_handle, ResponseCode::ServFail, started)
-            .await
+        self.send_status(
+            request,
+            response_handle,
+            ResponseCode::ServFail,
+            None,
+            started,
+        )
+        .await
     }
 }
 
@@ -1045,6 +1192,7 @@ fn response_edns(
     idle_timeout: Duration,
     client_subnet_v4_prefix: Option<u8>,
     client_subnet_v6_prefix: Option<u8>,
+    extended_error: Option<ExtendedDnsError>,
 ) -> Option<Edns> {
     request.edns.as_ref().map(|request_edns| {
         let mut edns = request_edns.clone();
@@ -1075,6 +1223,12 @@ fn response_edns(
         {
             edns.options_mut()
                 .insert(EdnsOption::Subnet(ClientSubnet::new(source, prefix, 0)));
+        }
+
+        if let Some(error) = extended_error {
+            edns.options_mut().remove(EdnsCode::Unknown(15));
+            edns.options_mut()
+                .insert(EdnsOption::Unknown(15, error.encode()));
         }
 
         edns
