@@ -83,6 +83,9 @@ pub async fn run_with_logging(
     install_ring_provider();
 
     let config_store = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let stats = Arc::new(Stats::default());
+    metrics::set_global_recorder(crate::metrics::EchoicMetricsRecorder::new(stats.clone()))
+        .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
     let cache_handle = Arc::new(ArcSwap::from_pointee(
         if config.cache.persistent || config.cache.serve_stale {
             Some(Arc::new(PersistentDnsCache::new(&config.cache)))
@@ -96,9 +99,6 @@ pub async fn run_with_logging(
         cache_handle.clone(),
     ));
     let resolver_handle = RecursorHandle::new(cached_resolver);
-    let stats = Arc::new(Stats::default());
-    metrics::set_global_recorder(crate::metrics::EchoicMetricsRecorder::new(stats.clone()))
-        .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
     let inflight = Arc::new(Semaphore::new(config.server_limits.max_inflight_queries));
     let inflight_store = Arc::new(ArcSwap::from_pointee(inflight));
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -811,6 +811,103 @@ fn is_reload_event(event: &Event) -> bool {
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     )
+}
+
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    use arc_swap::ArcSwap;
+    use hickory_server::proto::op::Message;
+    use hickory_server::proto::rr::{DNSClass, Name, RecordType};
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+
+    use crate::persistent_cache::{CacheKey, PersistentDnsCache};
+
+    #[tokio::test]
+    async fn reload_rebuilds_recursor_and_clears_persistent_cache() {
+        let directory = tempdir().expect("temporary directory");
+        let config_path = directory.path().join("echoic.toml");
+        let cache_path = directory.path().join("cache.json");
+
+        let initial = format!(
+            r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = false
+
+[cache]
+persistent = true
+path = "{}"
+max_entries = 100
+flush_interval = "1h"
+max_ttl = "1h"
+stale_ttl = "1h"
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+            cache_path.display()
+        );
+        std::fs::write(&config_path, &initial).expect("write configuration");
+        let config = Config::load(&config_path).expect("load configuration");
+
+        let cache_handle = Arc::new(ArcSwap::from_pointee(Some(Arc::new(
+            PersistentDnsCache::new(&config.cache),
+        ))));
+        let base = build_recursor(&config).expect("build recursor");
+        let resolver = RecursorHandle::new(Arc::new(CachedRecursiveResolver::new(
+            base,
+            cache_handle.clone(),
+        )));
+        assert!(!resolver.is_validating());
+
+        let loaded = cache_handle.load_full();
+        let cache = loaded.as_ref().as_ref().expect("cache");
+        let key = CacheKey {
+            name: Name::from_ascii("example.com.").expect("name"),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        cache.insert(key.clone(), Message::query(), SystemTime::now());
+        cache.flush();
+        assert!(cache.get(&key, SystemTime::now()).is_some());
+
+        let inflight = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(1))));
+        let runtimes = Arc::new(Mutex::new(Vec::new()));
+        let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = ReloadContext {
+            config: Arc::new(ArcSwap::from_pointee(config.clone())),
+            config_path: Some(config_path.clone()),
+            resolver: resolver.clone(),
+            cache_handle: cache_handle.clone(),
+            inflight: inflight.clone(),
+            runtimes: runtimes.clone(),
+            logging_reload: None,
+            limiters: limiters.clone(),
+        };
+
+        let updated = initial.replace("validate = false", "validate = true");
+        std::fs::write(&config_path, updated).expect("write configuration");
+
+        reload_once(&ctx, tx).await.expect("reload");
+
+        assert!(resolver.is_validating());
+        let reloaded_loaded = cache_handle.load_full();
+        let reloaded_cache = reloaded_loaded.as_ref().as_ref().expect("cache");
+        assert!(reloaded_cache.get(&key, SystemTime::now()).is_none());
+        assert!(!cache_path.exists());
+    }
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {

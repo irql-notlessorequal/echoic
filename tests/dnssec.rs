@@ -22,6 +22,7 @@ use arc_swap::ArcSwap;
 use echoic::config::Config;
 use echoic::listeners::{ListenerRuntime, start_listener};
 use echoic::query::QueryService;
+use echoic::recursor::build_recursor;
 use echoic::recursor::build_recursor_with_provider;
 use echoic::stats::Stats;
 use futures_util::Stream;
@@ -437,7 +438,7 @@ impl DnssecServer {
     }
 }
 
-fn config(root_hints: &std::path::Path, trust_anchor: &std::path::Path) -> Config {
+fn config(root_hints: &std::path::Path, trust_anchor: &std::path::Path, validate: bool) -> Config {
     let source = format!(
         r#"
 [logging]
@@ -445,6 +446,7 @@ level = "off"
 
 [dnssec]
 enabled = true
+validate = {}
 trust_anchor = "{}"
 
 [recursor]
@@ -456,13 +458,14 @@ name = "test"
 protocol = "udp"
 address = "127.0.0.1:0"
 "#,
+        validate,
         trust_anchor.display(),
         root_hints.display()
     );
     Config::from_toml_str(&source).expect("test configuration")
 }
 
-async fn start_dnssec_server() -> DnssecServer {
+async fn start_dnssec_server_with_validation(validate: bool) -> DnssecServer {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root_hints = directory.path().join("root.hints");
     std::fs::write(
@@ -478,9 +481,8 @@ async fn start_dnssec_server() -> DnssecServer {
     std::fs::write(&trust_anchor, format!(". 3600 IN DNSKEY {root_key}\n"))
         .expect("write trust anchor");
 
-    let config = config(&root_hints, &trust_anchor);
-    let resolver =
-        build_recursor_with_provider(&config, provider).expect("build validating recursor");
+    let config = config(&root_hints, &trust_anchor, validate);
+    let resolver = build_recursor_with_provider(&config, provider).expect("build DNSSEC recursor");
     let stats = Arc::new(Stats::default());
     let service = QueryService::new(
         resolver,
@@ -529,7 +531,7 @@ async fn udp_query(address: SocketAddr, message: Message) -> Message {
 
 #[tokio::test]
 async fn validates_secure_insecure_and_bogus_answers() {
-    let server = start_dnssec_server().await;
+    let server = start_dnssec_server_with_validation(true).await;
 
     let secure = udp_query(
         server.runtime.bound_address,
@@ -563,4 +565,73 @@ async fn validates_secure_insecure_and_bogus_answers() {
     assert_eq!(server.stats.snapshot().servfail, 1);
 
     server.stop().await;
+}
+
+#[tokio::test]
+async fn accepts_bogus_answers_when_validation_disabled() {
+    let server = start_dnssec_server_with_validation(false).await;
+
+    let bogus = udp_query(
+        server.runtime.bound_address,
+        query("www.bogus.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(bogus.metadata.response_code, ResponseCode::NoError);
+    assert!(!bogus.metadata.authentic_data);
+    assert!(bogus.answers.iter().any(|record| {
+        matches!(record.data, RData::A(address) if address.0 == Ipv4Addr::new(192, 0, 2, 20))
+    }));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn accepts_secure_answers_without_ad_when_validation_disabled() {
+    let server = start_dnssec_server_with_validation(false).await;
+
+    let mut secure_query = query("www.sub.example.", RecordType::A);
+    let mut edns = Edns::new();
+    edns.set_version(0);
+    edns.set_max_payload(4096);
+    edns.set_dnssec_ok(true);
+    secure_query.set_edns(edns);
+
+    let secure = udp_query(server.runtime.bound_address, secure_query).await;
+    assert_eq!(secure.metadata.response_code, ResponseCode::NoError);
+    assert!(!secure.metadata.authentic_data);
+    assert!(secure.answers.iter().any(|record| {
+        matches!(record.data, RData::A(address) if address.0 == Ipv4Addr::new(192, 0, 2, 10))
+    }));
+    assert!(
+        secure
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::RRSIG)
+    );
+
+    server.stop().await;
+}
+
+#[test]
+fn validation_disabled_recursor_is_not_validating() {
+    let source = r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = false
+
+[recursor]
+deny_server = []
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#;
+    let config = Config::from_toml_str(source).expect("test configuration");
+
+    let resolver = build_recursor(&config).expect("build DNSSEC recursor");
+    assert!(!resolver.is_validating());
 }

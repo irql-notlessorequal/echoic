@@ -98,3 +98,31 @@ impl Recorder for EchoicMetricsRecorder {
         Histogram::from_arc(Arc::new(NoopHistogram))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::stats::Stats;
+
+    #[test]
+    fn maps_hickory_cache_counters_to_stats() {
+        let stats = Arc::new(Stats::default());
+        let recorder = EchoicMetricsRecorder::new(stats.clone());
+
+        metrics::with_local_recorder(&recorder, || {
+            let hit = metrics::counter!("hickory_recursor_cache_hit_total");
+            let miss = metrics::counter!("hickory_recursor_cache_miss_total");
+            let unrelated = metrics::counter!("echoic_unrelated_metric");
+
+            hit.increment(2);
+            miss.increment(1);
+            unrelated.increment(10);
+        });
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.cache_hits, 2);
+        assert_eq!(snapshot.cache_misses, 1);
+    }
+}

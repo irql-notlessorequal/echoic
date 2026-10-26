@@ -250,7 +250,15 @@ pub fn build_recursor_with_provider<P: ConnectionProvider>(
         options.deny_server = deny_server.clone();
     }
 
-    let dnssec_policy = if config.dnssec.enabled {
+    let dnssec_policy = if !config.dnssec.enabled {
+        tracing::warn!("DNSSEC validation is disabled");
+        DnssecPolicy::SecurityUnaware
+    } else if !config.dnssec.validate {
+        tracing::warn!(
+            "DNSSEC validation is disabled by configuration; responses may be unsigned or bogus"
+        );
+        DnssecPolicy::ValidationDisabled
+    } else {
         #[allow(clippy::field_reassign_with_default)]
         let mut dnssec = HickoryDnssecConfig::default();
         if let Some(path) = &config.dnssec.trust_anchor {
@@ -263,15 +271,12 @@ pub fn build_recursor_with_provider<P: ConnectionProvider>(
         dnssec.nsec3_hard_iteration_limit = config.dnssec.nsec3_hard_iteration_limit;
         dnssec.validation_cache_size = config.dnssec.validation_cache_size;
         DnssecPolicy::ValidateWithStaticKey(dnssec)
-    } else {
-        tracing::warn!("DNSSEC validation is disabled");
-        DnssecPolicy::SecurityUnaware
     };
 
     let recursor = Recursor::new(&roots, dnssec_policy, None, options, provider)
         .map_err(|error| anyhow::anyhow!("failed to build recursor: {error}"))?;
 
-    if config.dnssec.enabled && !recursor.is_validating() {
+    if config.dnssec.enabled && config.dnssec.validate && !recursor.is_validating() {
         bail!("recursor was configured without DNSSEC validation");
     }
 

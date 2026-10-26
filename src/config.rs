@@ -839,6 +839,8 @@ pub enum QNameMinimization {
 pub struct DnssecConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub validate: bool,
     #[serde(default)]
     pub trust_anchor: Option<PathBuf>,
     #[serde(default)]
@@ -853,6 +855,7 @@ impl Default for DnssecConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            validate: true,
             trust_anchor: None,
             nsec3_soft_iteration_limit: None,
             nsec3_hard_iteration_limit: None,
@@ -1391,5 +1394,28 @@ tls = "public"
 require_dot_alpn = true
 "#;
         Config::from_toml_str(config).expect("dot listener should accept require_dot_alpn");
+    }
+
+    #[test]
+    fn dnssec_validation_defaults_to_enabled() {
+        let config = Config::from_toml_str(MINIMAL_CONFIG).expect("minimal config");
+        assert!(config.dnssec.enabled);
+        assert!(config.dnssec.validate);
+    }
+
+    #[test]
+    fn dnssec_validation_can_be_disabled() {
+        let config = format!(
+            r#"
+[dnssec]
+enabled = true
+validate = false
+
+{MINIMAL_CONFIG}
+"#
+        );
+        let config = Config::from_toml_str(&config).expect("config");
+        assert!(config.dnssec.enabled);
+        assert!(!config.dnssec.validate);
     }
 }

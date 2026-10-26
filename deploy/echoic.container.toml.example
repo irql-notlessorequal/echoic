@@ -54,6 +54,7 @@ edns_payload_len = 1232
 
 [dnssec]
 enabled = true
+validate = true
 nsec3_soft_iteration_limit = 150
 nsec3_hard_iteration_limit = 500
 validation_cache_size = 65536

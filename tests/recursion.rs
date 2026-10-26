@@ -21,6 +21,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use echoic::config::Config;
 use echoic::listeners::{ListenerRuntime, start_listener};
+use echoic::metrics::EchoicMetricsRecorder;
 use echoic::query::QueryService;
 use echoic::recursor::build_recursor_with_provider;
 use echoic::stats::Stats;
@@ -249,7 +250,7 @@ address = "127.0.0.1:0"
     Config::from_toml_str(&source).expect("test configuration")
 }
 
-async fn start_recursion_server() -> (RecursionServer, Counters) {
+async fn start_recursion_server(stats: Arc<Stats>) -> (RecursionServer, Counters) {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root_hints = directory.path().join("root.hints");
     std::fs::write(
@@ -264,7 +265,6 @@ async fn start_recursion_server() -> (RecursionServer, Counters) {
     let counters = Counters::default();
     let resolver = build_recursor_with_provider(&config, MockProvider::new(counters.clone()))
         .expect("build recursor");
-    let stats = Arc::new(Stats::default());
     let service = QueryService::new(
         resolver,
         &config.listeners[0],
@@ -318,7 +318,8 @@ async fn recurses_through_delegations_and_maps_negative_answers() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
-    let (server, counters) = start_recursion_server().await;
+    let stats = Arc::new(Stats::default());
+    let (server, counters) = start_recursion_server(stats.clone()).await;
 
     let response = udp_query(
         server.runtime.bound_address,
@@ -368,6 +369,37 @@ async fn recurses_through_delegations_and_maps_negative_answers() {
     assert!(counters.count(Role::Root) >= 1);
     assert!(counters.count(Role::Tld) >= 1);
     assert!(counters.count(Role::Auth) >= 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn recursor_cache_hit_is_recorded_after_startup() {
+    let stats = Arc::new(Stats::default());
+    metrics::set_global_recorder(EchoicMetricsRecorder::new(stats.clone()))
+        .expect("install metrics recorder");
+    let (server, counters) = start_recursion_server(stats.clone()).await;
+
+    let first = udp_query(
+        server.runtime.bound_address,
+        query("www.sub.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+
+    let root_count_after_first = counters.count(Role::Root);
+
+    let second = udp_query(
+        server.runtime.bound_address,
+        query("www.sub.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(second.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(counters.count(Role::Root), root_count_after_first);
+
+    let snapshot = stats.snapshot();
+    assert!(snapshot.cache_hits > 0);
+    assert!(snapshot.cache_hits + snapshot.cache_misses > 0);
 
     server.stop().await;
 }

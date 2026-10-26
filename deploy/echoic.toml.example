@@ -64,6 +64,7 @@ edns_payload_len = 1232
 
 [dnssec]
 enabled = true
+validate = true
 ## Omit trust_anchor to use Hickory's built-in root trust anchor.
 # trust_anchor = "/etc/echoic/root.key"
 nsec3_soft_iteration_limit = 150
