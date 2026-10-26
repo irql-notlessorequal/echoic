@@ -1,0 +1,30 @@
+[Unit]
+Description=Echoic recursive DNS resolver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=echoic
+Group=echoic
+ExecStart=/usr/local/bin/echoic --config /etc/echoic/echoic.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
