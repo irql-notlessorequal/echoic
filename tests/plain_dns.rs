@@ -565,3 +565,36 @@ async fn edns_padding_pads_response_to_block_size() {
 
     server.stop().await;
 }
+
+#[tokio::test]
+async fn tcp_keepalive_is_included_in_tcp_responses() {
+    let server = start(Protocol::Tcp, false).await;
+    let address = server.runtime.bound_address;
+
+    let mut request = Message::query();
+    request.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    let mut edns = Edns::new();
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(EdnsCode::Padding.into(), vec![0; 4]));
+    request.set_edns(edns);
+
+    let response = tcp_query(address, request).await;
+    let keepalive = response
+        .edns
+        .as_ref()
+        .expect("response edns")
+        .option(EdnsCode::Keepalive)
+        .expect("keepalive option");
+    match keepalive {
+        EdnsOption::Unknown(code, value) => {
+            assert_eq!(*code, u16::from(EdnsCode::Keepalive));
+            assert_eq!(u16::from_be_bytes([value[0], value[1]]), 10);
+        }
+        other => panic!("unexpected keepalive option: {other:?}"),
+    }
+
+    server.stop().await;
+}

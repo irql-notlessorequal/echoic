@@ -170,7 +170,12 @@ impl QueryService {
         metadata.recursion_available = true;
         metadata.response_code = response_code;
 
-        let mut edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(
+            request,
+            self.max_udp_payload(),
+            self.protocol,
+            self.idle_timeout(),
+        );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
@@ -243,7 +248,12 @@ impl QueryService {
             )
             && message_is_secure(&message);
 
-        let mut edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(
+            request,
+            self.max_udp_payload(),
+            self.protocol,
+            self.idle_timeout(),
+        );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
@@ -317,7 +327,12 @@ impl QueryService {
         metadata.response_code = response_code;
         metadata.authentic_data = authentic_data;
 
-        let mut edns = response_edns(request, self.max_udp_payload());
+        let mut edns = response_edns(
+            request,
+            self.max_udp_payload(),
+            self.protocol,
+            self.idle_timeout(),
+        );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
@@ -789,12 +804,27 @@ fn records_are_secure(records: &[Record]) -> bool {
     !records.is_empty() && records.iter().all(|record| record.proof.is_secure())
 }
 
-fn response_edns(request: &Request, max_udp_payload: u16) -> Option<Edns> {
+fn response_edns(
+    request: &Request,
+    max_udp_payload: u16,
+    protocol: Protocol,
+    idle_timeout: Duration,
+) -> Option<Edns> {
     request.edns.as_ref().map(|edns| {
         let mut edns = edns.clone();
         let max_payload = edns.max_payload().max(512).min(max_udp_payload);
         edns.set_max_payload(max_payload);
         edns.set_version(0);
+
+        if matches!(protocol, Protocol::Tcp | Protocol::Dot) {
+            let timeout = idle_timeout.as_secs().min(u16::MAX as u64).max(1) as u16;
+            edns.options_mut().remove(EdnsCode::Keepalive);
+            edns.options_mut().insert(EdnsOption::Unknown(
+                EdnsCode::Keepalive.into(),
+                timeout.to_be_bytes().to_vec(),
+            ));
+        }
+
         edns
     })
 }
