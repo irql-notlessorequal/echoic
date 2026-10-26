@@ -72,7 +72,7 @@ impl TestServer {
     }
 }
 
-async fn start() -> TestServer {
+async fn start_with_require_dot_alpn(require_dot_alpn: bool) -> TestServer {
     let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let dir = tempfile::tempdir().expect("tempdir");
     let cert_path = dir.path().join("cert.pem");
@@ -102,6 +102,7 @@ limits = { max_connections = 8 }
     // Attach tls entry manually via Config construction is not possible; use listener directly.
     let mut listener = config.listeners[0].clone();
     listener.tls = Some("public".to_string());
+    listener.require_dot_alpn = require_dot_alpn;
 
     let stats = Arc::new(Stats::default());
     let service = QueryService::new(
@@ -130,6 +131,10 @@ limits = { max_connections = 8 }
     .expect("start dot");
 
     TestServer { runtime, tls_state }
+}
+
+async fn start() -> TestServer {
+    start_with_require_dot_alpn(false).await
 }
 
 #[tokio::test]
@@ -174,6 +179,71 @@ async fn dot_resolves() {
     let response = Message::from_vec(&response).expect("decode");
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert_eq!(response.answers.len(), 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn dot_resolves_without_alpn() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = start().await;
+    let address = server.runtime.bound_address;
+
+    let mut client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    client_config.alpn_protocols.clear();
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    let tcp = TcpStream::connect(address).await.expect("tcp");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+    let mut tls = connector.connect(server_name, tcp).await.expect("tls");
+
+    let mut message = Message::query();
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    let bytes = message.to_vec().expect("encode");
+    tls.write_all(&(bytes.len() as u16).to_be_bytes())
+        .await
+        .expect("write len");
+    tls.write_all(&bytes).await.expect("write msg");
+    tls.flush().await.expect("flush");
+
+    let mut len_buf = [0_u8; 2];
+    tls.read_exact(&mut len_buf).await.expect("read len");
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut response = vec![0_u8; len];
+    tls.read_exact(&mut response).await.expect("read response");
+    let response = Message::from_vec(&response).expect("decode");
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(response.answers.len(), 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn dot_rejects_without_alpn_when_required() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = start_with_require_dot_alpn(true).await;
+    let address = server.runtime.bound_address;
+
+    let mut client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    client_config.alpn_protocols.clear();
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    let tcp = TcpStream::connect(address).await.expect("tcp");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+    let mut tls = connector.connect(server_name, tcp).await.expect("tls");
+
+    let mut len_buf = [0_u8; 2];
+    assert!(tls.read_exact(&mut len_buf).await.is_err());
 
     server.stop().await;
 }

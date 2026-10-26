@@ -187,6 +187,15 @@ impl Config {
 
     fn validate_listeners(&self, errors: &mut Vec<String>) {
         let mut names = HashSet::new();
+        for listener in &self.listeners {
+            if listener.require_dot_alpn && listener.protocol != Protocol::Dot {
+                errors.push(format!(
+                    "listener {:?}: require_dot_alpn is only valid for dot listeners",
+                    listener.name
+                ));
+            }
+        }
+
         let mut endpoints = HashSet::new();
 
         for listener in &self.listeners {
@@ -762,6 +771,8 @@ pub struct ListenerConfig {
     pub hostname: Option<String>,
     #[serde(default)]
     pub edns_padding_block_size: Option<usize>,
+    #[serde(default)]
+    pub require_dot_alpn: bool,
 }
 
 impl ListenerConfig {
@@ -1345,5 +1356,40 @@ hostname = "dns.example.com"
         );
         let error = Config::from_toml_str(&config).expect_err("invalid UTF-8 should be rejected");
         assert!(error.to_string().contains("landing_page.html"));
+    }
+
+    #[test]
+    fn rejects_require_dot_alpn_on_non_dot_listener() {
+        let config = r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+require_dot_alpn = true
+"#;
+        let error = Config::from_toml_str(config).expect_err("should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("require_dot_alpn is only valid for dot listeners")
+        );
+    }
+
+    #[test]
+    fn accepts_require_dot_alpn_on_dot_listener() {
+        let config = r#"
+[[tls]]
+name = "public"
+cert = "cert.pem"
+key = "key.pem"
+
+[[listeners]]
+name = "dot"
+protocol = "dot"
+address = "127.0.0.1:853"
+tls = "public"
+require_dot_alpn = true
+"#;
+        Config::from_toml_str(config).expect("dot listener should accept require_dot_alpn");
     }
 }

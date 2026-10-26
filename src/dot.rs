@@ -182,9 +182,18 @@ async fn handle_connection(
         }
     };
 
-    if tls_stream.get_ref().1.alpn_protocol() != Some(b"dot") {
-        tracing::debug!(src = %src_addr, "DoT connection missing dot ALPN");
-        return;
+    match tls_stream.get_ref().1.alpn_protocol() {
+        Some(b"dot") => {}
+        None if !service.state().load().require_dot_alpn => {}
+        other => {
+            tracing::debug!(
+                src = %src_addr,
+                alpn = ?other,
+                require_dot_alpn = service.state().load().require_dot_alpn,
+                "DoT connection rejected due to ALPN"
+            );
+            return;
+        }
     }
 
     let (mut buf_stream, stream_handle) = tls_from_stream(AsyncIoTokioAsStd(tls_stream), src_addr);

@@ -486,13 +486,24 @@ async fn reload_once(
 
     let mut new_tls_states = HashMap::new();
     for tls in &new_config.tls {
+        let mut alpn = Vec::new();
+        if new_config.listeners.iter().any(|listener| {
+            listener.tls.as_deref() == Some(tls.name.as_str()) && listener.protocol == Protocol::Dot
+        }) {
+            alpn.push(b"dot".to_vec());
+        }
+        if new_config.listeners.iter().any(|listener| {
+            listener.tls.as_deref() == Some(tls.name.as_str()) && listener.protocol == Protocol::Doh
+        }) {
+            alpn.push(b"h2".to_vec());
+            alpn.push(b"http/1.1".to_vec());
+        }
+        if alpn.is_empty() {
+            alpn.push(b"dot".to_vec());
+        }
         new_tls_states.insert(
             tls.name.clone(),
-            Arc::new(TlsState::load_with_alpn(
-                &tls.cert,
-                &tls.key,
-                vec![b"dot".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()],
-            )?),
+            Arc::new(TlsState::load_with_alpn(&tls.cert, &tls.key, alpn)?),
         );
     }
 
@@ -527,6 +538,7 @@ async fn reload_once(
             query_timeout: new_config.server_limits.query_timeout,
             idle_timeout: new_config.server_limits.idle_timeout,
             query_names: new_config.logging.query_names,
+            require_dot_alpn: new_listener.require_dot_alpn,
             edns_padding_block_size: new_listener.edns_padding_block_size(),
             client_subnet_v4_prefix: new_config.policy.edns_client_subnet_v4_prefix,
             client_subnet_v6_prefix: new_config.policy.edns_client_subnet_v6_prefix,

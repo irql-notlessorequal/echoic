@@ -33,6 +33,7 @@ name = "public-dot"
 protocol = "dot"
 address = "0.0.0.0:853"
 tls = "public"
+require_dot_alpn = false
 limits = { qps = 50, burst = 100, max_connections = 512 }
 edns_padding_block_size = 128
 
