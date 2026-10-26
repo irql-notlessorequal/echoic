@@ -273,6 +273,8 @@ async fn start_recursion_server() -> (RecursionServer, Counters) {
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,
+        config.policy.edns_client_subnet_v4_prefix,
+        config.policy.edns_client_subnet_v6_prefix,
     );
     let runtime = start_listener(
         &config.listeners[0],

@@ -96,6 +96,8 @@ pub async fn run_with_logging(
             &config.server_limits,
             config.policy.refuse_any,
             config.logging.query_names,
+            config.policy.edns_client_subnet_v4_prefix,
+            config.policy.edns_client_subnet_v6_prefix,
         );
 
         let runtime = if listener.protocol == Protocol::Dot {
@@ -439,6 +441,8 @@ async fn reload_once(
             idle_timeout: new_config.server_limits.idle_timeout,
             query_names: new_config.logging.query_names,
             edns_padding_block_size: new_listener.edns_padding_block_size(),
+            client_subnet_v4_prefix: new_config.policy.edns_client_subnet_v4_prefix,
+            client_subnet_v6_prefix: new_config.policy.edns_client_subnet_v6_prefix,
         };
         let query_state = Arc::new(state);
 

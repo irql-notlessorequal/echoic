@@ -114,6 +114,8 @@ limits = { max_connections = 8 }
         &config.server_limits,
         config.policy.refuse_any,
         false,
+        config.policy.edns_client_subnet_v4_prefix,
+        config.policy.edns_client_subnet_v6_prefix,
     );
 
     let runtime = start_dot_listener(

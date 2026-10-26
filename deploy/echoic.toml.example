@@ -4,6 +4,8 @@ query_names = false
 
 [policy]
 refuse_any = true
+# edns_client_subnet_v4_prefix = 24
+# edns_client_subnet_v6_prefix = 56
 
 [[tls]]
 name = "public"

@@ -13,7 +13,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,7 +27,7 @@ use echoic::recursor::RecursiveResolver;
 use echoic::stats::Stats;
 use hickory_server::proto::dnssec::Proof;
 use hickory_server::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+use hickory_server::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_server::proto::rr::rdata::{A, SOA};
 use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_server::resolver::recursor::{AuthorityData, RecursorError};
@@ -155,6 +155,8 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,
+        config.policy.edns_client_subnet_v4_prefix,
+        config.policy.edns_client_subnet_v6_prefix,
     );
     let runtime = start_listener(listener, service, config.server_limits.query_timeout)
         .await
@@ -595,6 +597,90 @@ async fn tcp_keepalive_is_included_in_tcp_responses() {
         }
         other => panic!("unexpected keepalive option: {other:?}"),
     }
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn ecs_is_generated_when_enabled() {
+    let source = r#"
+[logging]
+level = "off"
+
+[policy]
+refuse_any = true
+edns_client_subnet_v4_prefix = 24
+edns_client_subnet_v6_prefix = 56
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#;
+    let config = Config::from_toml_str(source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut request = Message::query();
+    request.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    request.set_edns(Edns::new());
+
+    let response = udp_query(address, request).await;
+    let ecs = response
+        .edns
+        .as_ref()
+        .expect("response edns")
+        .option(EdnsCode::Subnet)
+        .expect("generated ecs");
+    match ecs {
+        EdnsOption::Subnet(client_subnet) => {
+            assert_eq!(client_subnet.source_prefix(), 24);
+            assert_eq!(client_subnet.scope_prefix(), 0);
+        }
+        other => panic!("unexpected ecs option: {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn ecs_is_stripped_when_disabled() {
+    let server = start(Protocol::Udp, false).await;
+    let address = server.runtime.bound_address;
+
+    let mut request = Message::query();
+    request.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    let mut edns = Edns::new();
+    edns.options_mut()
+        .insert(EdnsOption::Subnet(ClientSubnet::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            24,
+            0,
+        )));
+    request.set_edns(edns);
+
+    let response = udp_query(address, request).await;
+    assert!(
+        response
+            .edns
+            .as_ref()
+            .expect("response edns")
+            .option(EdnsCode::Subnet)
+            .is_none()
+    );
 
     server.stop().await;
 }

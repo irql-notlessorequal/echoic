@@ -130,6 +130,7 @@ impl Config {
         self.validate_recursor(&mut errors);
         self.validate_dnssec(&mut errors);
         self.validate_server_limits(&mut errors);
+        self.validate_policy(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -349,6 +350,19 @@ impl Config {
                 "dnssec.nsec3_soft_iteration_limit must not exceed nsec3_hard_iteration_limit"
                     .to_owned(),
             );
+        }
+    }
+
+    fn validate_policy(&self, errors: &mut Vec<String>) {
+        if let Some(prefix) = self.policy.edns_client_subnet_v4_prefix
+            && !(1..=32).contains(&prefix)
+        {
+            errors.push("policy.edns_client_subnet_v4_prefix must be between 1 and 32".to_owned());
+        }
+        if let Some(prefix) = self.policy.edns_client_subnet_v6_prefix
+            && !(1..=128).contains(&prefix)
+        {
+            errors.push("policy.edns_client_subnet_v6_prefix must be between 1 and 128".to_owned());
         }
     }
 
@@ -588,11 +602,19 @@ fn default_log_level() -> String {
 pub struct PolicyConfig {
     #[serde(default = "default_true")]
     pub refuse_any: bool,
+    #[serde(default)]
+    pub edns_client_subnet_v4_prefix: Option<u8>,
+    #[serde(default)]
+    pub edns_client_subnet_v6_prefix: Option<u8>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self { refuse_any: true }
+        Self {
+            refuse_any: true,
+            edns_client_subnet_v4_prefix: None,
+            edns_client_subnet_v6_prefix: None,
+        }
     }
 }
 

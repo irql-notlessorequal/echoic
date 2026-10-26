@@ -27,7 +27,7 @@ use hickory_server::proto::op::{
     Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode,
 };
 use hickory_server::proto::rr::rdata::SOA;
-use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+use hickory_server::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_server::proto::rr::{DNSClass, Record, RecordType};
 use hickory_server::resolver::recursor::RecursorError;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -49,6 +49,8 @@ pub struct ListenerQueryState {
     pub idle_timeout: Duration,
     pub query_names: bool,
     pub edns_padding_block_size: usize,
+    pub client_subnet_v4_prefix: Option<u8>,
+    pub client_subnet_v6_prefix: Option<u8>,
 }
 
 pub struct QueryService {
@@ -61,6 +63,7 @@ pub struct QueryService {
 }
 
 impl QueryService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         resolver: Arc<dyn RecursiveResolver>,
         listener: &ListenerConfig,
@@ -69,6 +72,8 @@ impl QueryService {
         server_limits: &ServerLimits,
         refuse_any: bool,
         query_names: bool,
+        client_subnet_v4_prefix: Option<u8>,
+        client_subnet_v6_prefix: Option<u8>,
     ) -> Self {
         let limits = listener.limits.effective(listener.protocol);
         let state = ListenerQueryState {
@@ -80,6 +85,8 @@ impl QueryService {
             idle_timeout: server_limits.idle_timeout,
             query_names,
             edns_padding_block_size: listener.edns_padding_block_size(),
+            client_subnet_v4_prefix,
+            client_subnet_v6_prefix,
         };
 
         Self {
@@ -126,6 +133,14 @@ impl QueryService {
 
     pub fn edns_padding_block_size(&self) -> usize {
         self.state.load().edns_padding_block_size
+    }
+
+    pub fn client_subnet_v4_prefix(&self) -> Option<u8> {
+        self.state.load().client_subnet_v4_prefix
+    }
+
+    pub fn client_subnet_v6_prefix(&self) -> Option<u8> {
+        self.state.load().client_subnet_v6_prefix
     }
 
     pub fn max_udp_payload(&self) -> u16 {
@@ -175,6 +190,8 @@ impl QueryService {
             self.max_udp_payload(),
             self.protocol,
             self.idle_timeout(),
+            self.client_subnet_v4_prefix(),
+            self.client_subnet_v6_prefix(),
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -253,6 +270,8 @@ impl QueryService {
             self.max_udp_payload(),
             self.protocol,
             self.idle_timeout(),
+            self.client_subnet_v4_prefix(),
+            self.client_subnet_v6_prefix(),
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -332,6 +351,8 @@ impl QueryService {
             self.max_udp_payload(),
             self.protocol,
             self.idle_timeout(),
+            self.client_subnet_v4_prefix(),
+            self.client_subnet_v6_prefix(),
         );
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
@@ -809,9 +830,11 @@ fn response_edns(
     max_udp_payload: u16,
     protocol: Protocol,
     idle_timeout: Duration,
+    client_subnet_v4_prefix: Option<u8>,
+    client_subnet_v6_prefix: Option<u8>,
 ) -> Option<Edns> {
-    request.edns.as_ref().map(|edns| {
-        let mut edns = edns.clone();
+    request.edns.as_ref().map(|request_edns| {
+        let mut edns = request_edns.clone();
         let max_payload = edns.max_payload().max(512).min(max_udp_payload);
         edns.set_max_payload(max_payload);
         edns.set_version(0);
@@ -823,6 +846,22 @@ fn response_edns(
                 EdnsCode::Keepalive.into(),
                 timeout.to_be_bytes().to_vec(),
             ));
+        }
+
+        let source = normalize_ip(request.src().ip());
+        let client_ecs = request_edns.option(EdnsCode::Subnet).cloned();
+        let enabled_prefix = match source {
+            IpAddr::V4(_) => client_subnet_v4_prefix,
+            IpAddr::V6(_) => client_subnet_v6_prefix,
+        };
+
+        if enabled_prefix.is_none() {
+            edns.options_mut().remove(EdnsCode::Subnet);
+        } else if client_ecs.is_none()
+            && let Some(prefix) = enabled_prefix
+        {
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::new(source, prefix, 0)));
         }
 
         edns
