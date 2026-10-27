@@ -63,6 +63,11 @@ impl RecursiveResolver for MockResolver {
                 response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Secure));
                 Ok(response)
             }
+            "secure-extra.example." => {
+                response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Secure));
+                response.add_additional(a_record("extra.example.", [192, 0, 2, 2], Proof::Bogus));
+                Ok(response)
+            }
             "large.example." => {
                 for index in 0..200 {
                     let octet = u8::try_from(index % 250).expect("octet");
@@ -317,6 +322,25 @@ async fn forwards_dnssec_ok_and_sets_ad_for_secure_answers() {
     .await;
     assert!(response.metadata.authentic_data);
     assert!(!server.mock.saw_dnssec_ok.load(Ordering::SeqCst));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn bogus_additional_does_not_fail_secure_answer() {
+    let server = start(Protocol::Udp, true).await;
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("secure-extra.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.metadata.authentic_data);
+    assert_eq!(response.answers.len(), 1);
+    assert!(response.additionals.is_empty());
+    assert_eq!(ede_info_code(&response), None);
+    assert_eq!(server.stats.snapshot().servfail, 0);
 
     server.stop().await;
 }

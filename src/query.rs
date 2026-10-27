@@ -296,24 +296,46 @@ impl QueryService {
         &self,
         request: &Request,
         mut response_handle: R,
-        message: hickory_server::proto::op::Message,
+        mut message: hickory_server::proto::op::Message,
         extended_error: Option<ExtendedDnsError>,
         started: Instant,
     ) -> ResponseInfo {
-        if self.validating() && message_is_bogus(&message) {
-            tracing::warn!(
-                listener = %self.listener_name,
-                "DNSSEC validation failed"
-            );
-            return self
-                .send_status(
-                    request,
-                    response_handle,
-                    ResponseCode::ServFail,
-                    Some(ExtendedDnsError::DnssecBogus),
-                    started,
-                )
-                .await;
+        if self.validating() {
+            if message_is_bogus(&message) {
+                let answer_types = bogus_record_types(&message.answers);
+                let authority_types = bogus_record_types(&message.authorities);
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    answer_types = ?answer_types,
+                    authority_types = ?authority_types,
+                    "DNSSEC validation failed"
+                );
+                return self
+                    .send_status(
+                        request,
+                        response_handle,
+                        ResponseCode::ServFail,
+                        Some(ExtendedDnsError::DnssecBogus),
+                        started,
+                    )
+                    .await;
+            }
+
+            if message
+                .additionals
+                .iter()
+                .any(|record| record.proof.is_bogus())
+            {
+                let record_types = bogus_record_types(&message.additionals);
+                tracing::debug!(
+                    listener = %self.listener_name,
+                    record_types = ?record_types,
+                    "dropping bogus DNSSEC additional records"
+                );
+                message
+                    .additionals
+                    .retain(|record| !record.proof.is_bogus());
+            }
         }
 
         let response_code = message.metadata.response_code;
@@ -1195,12 +1217,19 @@ fn negative_from_authority_data(
     })
 }
 
+fn bogus_record_types(records: &[Record]) -> Vec<RecordType> {
+    records
+        .iter()
+        .filter(|record| record.proof.is_bogus())
+        .map(Record::record_type)
+        .collect()
+}
+
 fn message_is_bogus(message: &hickory_server::proto::op::Message) -> bool {
     message
         .answers
         .iter()
         .chain(message.authorities.iter())
-        .chain(message.additionals.iter())
         .any(|record| record.proof.is_bogus())
 }
 
