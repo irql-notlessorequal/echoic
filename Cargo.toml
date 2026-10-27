@@ -1,6 +1,6 @@
 [package]
 name = "echoic"
-version = "0.1.0"
+version = "2026.10.0"
 edition = "2024"
 rust-version = "1.98.1"
 description = "Recursive DNS resolver with DNSSEC, DoT and DoH support"
