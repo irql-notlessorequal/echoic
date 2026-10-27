@@ -94,21 +94,30 @@ impl CaptureResponse {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DsResponseMode {
+    Normal,
+    ChildSoa,
+    Empty,
+}
+
 #[derive(Clone)]
 struct SignedProvider {
     root: Arc<Catalog>,
     tld: Arc<Catalog>,
     auth: Arc<Catalog>,
     runtime: TokioRuntimeProvider,
+    ds_mode: DsResponseMode,
 }
 
 impl SignedProvider {
-    fn new(root: Catalog, tld: Catalog, auth: Catalog) -> Self {
+    fn new(root: Catalog, tld: Catalog, auth: Catalog, ds_mode: DsResponseMode) -> Self {
         Self {
             root: Arc::new(root),
             tld: Arc::new(tld),
             auth: Arc::new(auth),
             runtime: TokioRuntimeProvider::new(),
+            ds_mode,
         }
     }
 }
@@ -134,7 +143,10 @@ impl ConnectionProvider for SignedProvider {
             return Err(NetError::from(format!("unexpected mock server {ip}")));
         };
 
-        Ok(std::future::ready(Ok(SignedHandle { catalog })))
+        Ok(std::future::ready(Ok(SignedHandle {
+            catalog,
+            ds_mode: self.ds_mode,
+        })))
     }
 
     fn runtime_provider(&self) -> &Self::RuntimeProvider {
@@ -145,6 +157,7 @@ impl ConnectionProvider for SignedProvider {
 #[derive(Clone)]
 struct SignedHandle {
     catalog: Arc<Catalog>,
+    ds_mode: DsResponseMode,
 }
 
 impl DnsHandle for SignedHandle {
@@ -153,18 +166,26 @@ impl DnsHandle for SignedHandle {
 
     fn send(&self, request: DnsRequest) -> Self::Response {
         let catalog = self.catalog.clone();
+        let ds_mode = self.ds_mode;
         Box::pin(futures_util::stream::once(async move {
-            answer(&catalog, &request).await
+            answer(&catalog, &request, ds_mode).await
         }))
     }
 }
 
-async fn answer(catalog: &Catalog, request: &DnsRequest) -> Result<DnsResponse, NetError> {
+async fn answer(
+    catalog: &Catalog,
+    request: &DnsRequest,
+    ds_mode: DsResponseMode,
+) -> Result<DnsResponse, NetError> {
     let query = request
         .queries
         .first()
         .cloned()
         .ok_or_else(|| NetError::from("mock request without a query"))?;
+
+    let query_name = query.name.clone();
+    let query_type = query.query_type();
 
     let mut message = Message::query();
     message.metadata.id = request.metadata.id;
@@ -174,8 +195,6 @@ async fn answer(catalog: &Catalog, request: &DnsRequest) -> Result<DnsResponse, 
     edns.set_dnssec_ok(true);
     edns.set_max_payload(1232);
     message.edns = Some(edns);
-
-    let query_type = request.queries.first().map(|query| query.query_type());
 
     let bytes = message.to_vec().map_err(NetError::from)?;
     let request = Request::from_bytes(
@@ -194,7 +213,21 @@ async fn answer(catalog: &Catalog, request: &DnsRequest) -> Result<DnsResponse, 
         .take()
         .ok_or_else(|| NetError::from("mock catalog did not respond"))?;
     let mut message = Message::from_vec(&bytes).map_err(NetError::from)?;
-    if query_type == Some(RecordType::NS) {
+    if query_type == RecordType::DS
+        && !matches!(ds_mode, DsResponseMode::Normal)
+        && (query_name == name("child.insecure.example.")
+            || query_name == name("child.sub.example."))
+    {
+        message.answers.clear();
+        message.authorities.clear();
+        message.additionals.clear();
+        if matches!(ds_mode, DsResponseMode::ChildSoa) {
+            let primary = format!("ns.{query_name}");
+            let mailbox = format!("hostmaster.{query_name}");
+            message.add_authority(soa(&query_name, &primary, &mailbox));
+        }
+    }
+    if query_type == RecordType::NS {
         add_glue(&mut message);
     }
     DnsResponse::from_message(message).map_err(NetError::from)
@@ -231,7 +264,11 @@ fn glue_address(target: &Name) -> Option<Ipv4Addr> {
     match target.to_string().to_ascii_lowercase().as_str() {
         "a.root-servers.test." => Some(ROOT_IP),
         "ns.example." => Some(TLD_IP),
-        "ns.sub.example." | "ns.bogus.example." | "ns.insecure.example." => Some(AUTH_IP),
+        "ns.sub.example."
+        | "ns.bogus.example."
+        | "ns.insecure.example."
+        | "ns.child.insecure.example."
+        | "ns.child.sub.example." => Some(AUTH_IP),
         _ => None,
     }
 }
@@ -314,7 +351,7 @@ fn catalog(zone: InMemoryZoneHandler) -> Catalog {
     catalog
 }
 
-fn signed_hierarchy() -> (SignedProvider, DNSKEY) {
+fn signed_hierarchy(ds_mode: DsResponseMode) -> (SignedProvider, DNSKEY) {
     let sub_origin = name("sub.example.");
     let sub = zone(
         &sub_origin,
@@ -323,9 +360,26 @@ fn signed_hierarchy() -> (SignedProvider, DNSKEY) {
             ns(&sub_origin, "ns.sub.example."),
             a("ns.sub.example.", AUTH_IP),
             a("www.sub.example.", Ipv4Addr::new(192, 0, 2, 10)),
+            ns(&name("child.sub.example."), "ns.child.sub.example."),
+            a("ns.child.sub.example.", AUTH_IP),
         ],
     );
     let (sub, sub_key) = secure_zone(sub, &sub_origin);
+
+    let child_sub_origin = name("child.sub.example.");
+    let child_sub = zone(
+        &child_sub_origin,
+        vec![
+            soa(
+                &child_sub_origin,
+                "ns.child.sub.example.",
+                "hostmaster.child.sub.example.",
+            ),
+            ns(&child_sub_origin, "ns.child.sub.example."),
+            a("ns.child.sub.example.", AUTH_IP),
+            a("www.child.sub.example.", Ipv4Addr::new(192, 0, 2, 41)),
+        ],
+    );
 
     let bogus_origin = name("bogus.example.");
     let bogus = zone(
@@ -367,6 +421,26 @@ fn signed_hierarchy() -> (SignedProvider, DNSKEY) {
             ns(&insecure_origin, "ns.insecure.example."),
             a("ns.insecure.example.", AUTH_IP),
             a("www.insecure.example.", Ipv4Addr::new(192, 0, 2, 30)),
+            ns(
+                &name("child.insecure.example."),
+                "ns.child.insecure.example.",
+            ),
+            a("ns.child.insecure.example.", AUTH_IP),
+        ],
+    );
+
+    let child_insecure_origin = name("child.insecure.example.");
+    let child_insecure = zone(
+        &child_insecure_origin,
+        vec![
+            soa(
+                &child_insecure_origin,
+                "ns.child.insecure.example.",
+                "hostmaster.child.insecure.example.",
+            ),
+            ns(&child_insecure_origin, "ns.child.insecure.example."),
+            a("ns.child.insecure.example.", AUTH_IP),
+            a("www.child.insecure.example.", Ipv4Addr::new(192, 0, 2, 40)),
         ],
     );
 
@@ -412,6 +486,10 @@ fn signed_hierarchy() -> (SignedProvider, DNSKEY) {
         vec![Arc::new(sub) as Arc<dyn ZoneHandler>],
     );
     auth.upsert(
+        LowerName::new(child_sub.origin()),
+        vec![Arc::new(child_sub) as Arc<dyn ZoneHandler>],
+    );
+    auth.upsert(
         LowerName::new(bogus.origin()),
         vec![Arc::new(bogus) as Arc<dyn ZoneHandler>],
     );
@@ -419,9 +497,13 @@ fn signed_hierarchy() -> (SignedProvider, DNSKEY) {
         LowerName::new(insecure.origin()),
         vec![Arc::new(insecure) as Arc<dyn ZoneHandler>],
     );
+    auth.upsert(
+        LowerName::new(child_insecure.origin()),
+        vec![Arc::new(child_insecure) as Arc<dyn ZoneHandler>],
+    );
 
     (
-        SignedProvider::new(catalog(root), catalog(example), auth),
+        SignedProvider::new(catalog(root), catalog(example), auth, ds_mode),
         root_key,
     )
 }
@@ -466,6 +548,10 @@ address = "127.0.0.1:0"
 }
 
 async fn start_dnssec_server_with_validation(validate: bool) -> DnssecServer {
+    start_dnssec_server(validate, DsResponseMode::Normal).await
+}
+
+async fn start_dnssec_server(validate: bool, ds_mode: DsResponseMode) -> DnssecServer {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root_hints = directory.path().join("root.hints");
     std::fs::write(
@@ -476,7 +562,7 @@ async fn start_dnssec_server_with_validation(validate: bool) -> DnssecServer {
     )
     .expect("write root hints");
 
-    let (provider, root_key) = signed_hierarchy();
+    let (provider, root_key) = signed_hierarchy(ds_mode);
     let trust_anchor = directory.path().join("trust-anchor.key");
     std::fs::write(&trust_anchor, format!(". 3600 IN DNSKEY {root_key}\n"))
         .expect("write trust anchor");
@@ -562,6 +648,60 @@ async fn validates_secure_insecure_and_bogus_answers() {
     .await;
     assert_eq!(bogus.metadata.response_code, ResponseCode::ServFail);
     assert!(bogus.answers.is_empty());
+    assert_eq!(server.stats.snapshot().servfail, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn accepts_insecure_delegation_with_child_soa_in_ds_response() {
+    let server = start_dnssec_server(true, DsResponseMode::ChildSoa).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("www.child.insecure.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(!response.metadata.authentic_data);
+    assert!(response.answers.iter().any(|record| {
+        matches!(record.data, RData::A(address) if address.0 == Ipv4Addr::new(192, 0, 2, 40))
+    }));
+    assert_eq!(server.stats.snapshot().servfail, 0);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn accepts_insecure_delegation_with_empty_ds_response() {
+    let server = start_dnssec_server(true, DsResponseMode::Empty).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("www.child.insecure.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(!response.metadata.authentic_data);
+    assert!(response.answers.iter().any(|record| {
+        matches!(record.data, RData::A(address) if address.0 == Ipv4Addr::new(192, 0, 2, 40))
+    }));
+    assert_eq!(server.stats.snapshot().servfail, 0);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rejects_child_soa_for_secure_delegation() {
+    let server = start_dnssec_server(true, DsResponseMode::ChildSoa).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("www.child.sub.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(response.answers.is_empty());
     assert_eq!(server.stats.snapshot().servfail, 1);
 
     server.stop().await;
