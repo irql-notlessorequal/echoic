@@ -53,6 +53,7 @@ pub struct DohRuntimeState {
     pub max_concurrent_requests: usize,
     pub max_doh_body: usize,
     pub max_doh_uri: usize,
+    pub tcp_notsent_lowat: u32,
     pub concurrency: Arc<Semaphore>,
     pub landing_html: Option<String>,
     pub landing_css: Option<String>,
@@ -127,6 +128,7 @@ pub async fn start_doh_listener(
         max_concurrent_requests,
         max_doh_body,
         max_doh_uri,
+        tcp_notsent_lowat: listener.tcp_notsent_lowat(),
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
         landing_html: landing_html.clone(),
         landing_css: landing_css.clone(),
@@ -189,6 +191,7 @@ pub async fn start_doh_listener(
 
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
+        let mut tcp_notsent_lowat_disabled = false;
         loop {
             tokio::select! {
                 _ = task_token.cancelled() => break,
@@ -217,8 +220,24 @@ pub async fn start_doh_listener(
                     let handshake_timeout = service.query_timeout();
                     let token = task_token.clone();
                     let app = app_for_task.clone();
-                    let doh_runtime = doh_runtime_for_task.clone();
-                    let max_streams = doh_runtime.load().max_concurrent_requests as u32;
+                    let doh_runtime = doh_runtime_for_task.load();
+                    let max_streams = doh_runtime.max_concurrent_requests as u32;
+                    let tcp_notsent_lowat = doh_runtime.tcp_notsent_lowat;
+                    drop(doh_runtime);
+                    if tcp_notsent_lowat != 0
+                        && !tcp_notsent_lowat_disabled
+                        && let Err(error) =
+                            apply_tcp_notsent_lowat(&tcp_stream, tcp_notsent_lowat)
+                    {
+                        tcp_notsent_lowat_disabled = true;
+                        tracing::warn!(
+                            listener = %listener_name,
+                            src = %src_addr,
+                            value = tcp_notsent_lowat,
+                            error = %error,
+                            "failed to set DoH TCP_NOTSENT_LOWAT; disabling it for this listener until restart"
+                        );
+                    }
                     connections.spawn(async move {
                         let _permit = permit;
                         let tls_stream = match tokio::time::timeout(handshake_timeout, tls_state.acceptor().accept(tcp_stream)).await {
@@ -727,11 +746,40 @@ where
     }
 }
 
+fn apply_tcp_notsent_lowat(stream: &tokio::net::TcpStream, value: u32) -> std::io::Result<()> {
+    socket2::SockRef::from(stream).set_tcp_notsent_lowat(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Protocol;
     use crate::stats::Stats;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn applies_tcp_notsent_lowat_to_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect")
+        });
+        let (stream, _) = listener.accept().await.expect("accept");
+        let _client = client.await.expect("client task");
+
+        match apply_tcp_notsent_lowat(&stream, 32_768) {
+            Ok(()) => {
+                let socket = socket2::SockRef::from(&stream);
+                assert_eq!(socket.tcp_notsent_lowat().expect("read option"), 32_768);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
+            Err(error) => panic!("set option: {error}"),
+        }
+    }
 
     #[test]
     fn landing_template_replaces_placeholders() {

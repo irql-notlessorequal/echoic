@@ -41,6 +41,7 @@ const DEFAULT_EDNS_PAYLOAD_LEN: u16 = 1232;
 const DEFAULT_MAX_UDP_PAYLOAD: u16 = 1232;
 const DEFAULT_MAX_DOH_BODY: usize = 65_535;
 const DEFAULT_MAX_DOH_URI: usize = 8_192;
+const DEFAULT_TCP_NOTSENT_LOWAT: u32 = 16 * 1024;
 const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 2_048;
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -191,6 +192,12 @@ impl Config {
             if listener.require_dot_alpn && listener.protocol != Protocol::Dot {
                 errors.push(format!(
                     "listener {:?}: require_dot_alpn is only valid for dot listeners",
+                    listener.name
+                ));
+            }
+            if listener.tcp_notsent_lowat.is_some() && listener.protocol != Protocol::Doh {
+                errors.push(format!(
+                    "listener {:?}: tcp_notsent_lowat is only valid for doh listeners",
                     listener.name
                 ));
             }
@@ -773,11 +780,17 @@ pub struct ListenerConfig {
     pub edns_padding_block_size: Option<usize>,
     #[serde(default)]
     pub require_dot_alpn: bool,
+    #[serde(default)]
+    pub tcp_notsent_lowat: Option<u32>,
 }
 
 impl ListenerConfig {
     pub fn edns_padding_block_size(&self) -> usize {
         self.edns_padding_block_size.unwrap_or(128)
+    }
+
+    pub fn tcp_notsent_lowat(&self) -> u32 {
+        self.tcp_notsent_lowat.unwrap_or(DEFAULT_TCP_NOTSENT_LOWAT)
     }
 }
 
@@ -1394,6 +1407,67 @@ tls = "public"
 require_dot_alpn = true
 "#;
         Config::from_toml_str(config).expect("dot listener should accept require_dot_alpn");
+    }
+
+    #[test]
+    fn doh_listener_defaults_tcp_notsent_lowat() {
+        let config = r#"
+[[tls]]
+name = "public"
+cert = "cert.pem"
+key = "key.pem"
+
+[[listeners]]
+name = "doh"
+protocol = "doh"
+address = "127.0.0.1:443"
+tls = "public"
+hostname = "dns.example.com"
+"#;
+        let config = Config::from_toml_str(config).expect("doh listener should be valid");
+        assert_eq!(
+            config.listeners[0].tcp_notsent_lowat(),
+            DEFAULT_TCP_NOTSENT_LOWAT
+        );
+    }
+
+    #[test]
+    fn accepts_tcp_notsent_lowat_on_doh_listener() {
+        for value in [0, 32_768] {
+            let config = format!(
+                r#"
+[[tls]]
+name = "public"
+cert = "cert.pem"
+key = "key.pem"
+
+[[listeners]]
+name = "doh"
+protocol = "doh"
+address = "127.0.0.1:443"
+tls = "public"
+hostname = "dns.example.com"
+tcp_notsent_lowat = {value}
+"#
+            );
+            let config = Config::from_toml_str(&config).expect("doh listener should be valid");
+            assert_eq!(config.listeners[0].tcp_notsent_lowat(), value);
+        }
+    }
+
+    #[test]
+    fn rejects_tcp_notsent_lowat_on_non_doh_listener() {
+        let config = r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+tcp_notsent_lowat = 16384
+"#;
+        assert!(
+            validation_message(config)
+                .contains("tcp_notsent_lowat is only valid for doh listeners")
+        );
     }
 
     #[test]

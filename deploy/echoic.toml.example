@@ -45,6 +45,7 @@ tls = "public"
 hostname = "dns.example.com"
 limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests = 128 }
 edns_padding_block_size = 128
+tcp_notsent_lowat = 16384
 
 [recursor]
 ## Omit root_hints to use the embedded root hints file.

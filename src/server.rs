@@ -581,6 +581,7 @@ async fn reload_once(
                 max_concurrent_requests,
                 max_doh_body: new_config.server_limits.max_doh_body,
                 max_doh_uri: new_config.server_limits.max_doh_uri,
+                tcp_notsent_lowat: new_listener.tcp_notsent_lowat(),
                 concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
                 landing_html,
                 landing_css,

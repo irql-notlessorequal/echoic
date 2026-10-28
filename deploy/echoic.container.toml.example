@@ -42,6 +42,7 @@ tls = "public"
 hostname = "dns.example.com"
 limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests = 128 }
 edns_padding_block_size = 128
+tcp_notsent_lowat = 16384
 
 [recursor]
 response_cache_size = 1048576
