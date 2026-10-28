@@ -48,3 +48,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [patch.crates-io]
 hickory-net = { path = "vendor/hickory-net-0.26.3" }
+hickory-resolver = { path = "vendor/hickory-resolver-0.26.3" }

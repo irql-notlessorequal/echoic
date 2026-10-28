@@ -421,7 +421,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "echoic"
-version = "0.1.0"
+version = "2026.10.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -753,8 +753,6 @@ dependencies = [
 [[package]]
 name = "hickory-resolver"
 version = "0.26.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
 dependencies = [
  "async-recursion",
  "cfg-if",
