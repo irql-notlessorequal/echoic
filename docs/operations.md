@@ -14,6 +14,8 @@ Certificates are loaded from the paths in the TLS configuration. Use a certbot d
 
 Omit `recursor.root_hints` to use the embedded root hints. Omit `dnssec.trust_anchor` to use Hickory's built-in root trust anchor. Changing either setting rebuilds the recursor and clears its cache.
 
+DNSSEC validation is enabled by default. Bogus records in the answer or authority section return SERVFAIL; bogus records in the additional section are removed from the response. Set `dnssec.validate = false` only when unsigned or invalid data must be accepted; DNSSEC records are still requested, but responses are not validated and the AD bit is never set.
+
 ## systemd-resolved
 
 On hosts where systemd-resolved binds port 53, disable or reconfigure it before starting Echoic.
