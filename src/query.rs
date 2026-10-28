@@ -39,6 +39,8 @@ use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
 use crate::recursor::{RecursiveResolver, RecursorHandle};
 use crate::stats::Stats;
 
+const KEEPALIVE_TIMEOUT_UNIT_MS: u128 = 100;
+
 #[derive(Clone, Copy, Debug)]
 enum ExtendedDnsError {
     DnssecBogus,
@@ -1265,7 +1267,10 @@ fn response_edns(
         edns.set_version(0);
 
         if matches!(protocol, Protocol::Tcp | Protocol::Dot) {
-            let timeout = idle_timeout.as_secs().min(u16::MAX as u64).max(1) as u16;
+            let timeout = idle_timeout
+                .as_millis()
+                .div_ceil(KEEPALIVE_TIMEOUT_UNIT_MS)
+                .clamp(1, u16::MAX as u128) as u16;
             edns.options_mut().remove(EdnsCode::Keepalive);
             edns.options_mut().insert(EdnsOption::Unknown(
                 EdnsCode::Keepalive.into(),

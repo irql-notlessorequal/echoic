@@ -39,6 +39,8 @@ use crate::listeners::ListenerRuntime;
 use crate::query::QueryService;
 use crate::tls::TlsState;
 
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 pub async fn start_dot_listener(
     listener: &ListenerConfig,
     service: QueryService,
@@ -96,9 +98,7 @@ pub async fn start_dot_listener(
                         Ok(result) => result,
                         Err(error) => {
                             tracing::debug!(listener = %listener_name, error = %error, "error accepting DoT connection");
-                            if is_unrecoverable_socket_error(&error) {
-                                break;
-                            }
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                             continue;
                         }
                     };
@@ -251,13 +251,4 @@ async fn handle_connection(
             }
         }
     }
-}
-
-fn is_unrecoverable_socket_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::BrokenPipe
-    )
 }

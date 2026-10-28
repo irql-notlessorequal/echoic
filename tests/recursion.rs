@@ -29,7 +29,7 @@ use hickory_server::net::NetError;
 use hickory_server::net::runtime::TokioRuntimeProvider;
 use hickory_server::net::xfer::DnsHandle;
 use hickory_server::proto::op::{DnsRequest, DnsResponse, Message, OpCode, Query, ResponseCode};
-use hickory_server::proto::rr::rdata::{A, NS, SOA};
+use hickory_server::proto::rr::rdata::{A, CNAME, NS, SOA};
 use hickory_server::proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::resolver::config::ConnectionConfig;
 use hickory_server::resolver::{ConnectionProvider, PoolContext};
@@ -170,6 +170,17 @@ fn answer(role: Role, id: u16, query: &Query) -> Message {
                 response.metadata.authoritative = true;
                 response.add_authority(soa_record("sub.example."));
             }
+            "alias.sub.example." => {
+                response.metadata.authoritative = true;
+                response.add_answer(cname_record("alias.sub.example.", "nodata.sub.example."));
+            }
+            "alias-missing.sub.example." => {
+                response.metadata.authoritative = true;
+                response.add_answer(cname_record(
+                    "alias-missing.sub.example.",
+                    "missing.sub.example.",
+                ));
+            }
             _ => {
                 response.metadata.authoritative = true;
                 response.metadata.response_code = ResponseCode::NXDomain;
@@ -196,6 +207,14 @@ fn a_record(name: &str, address: Ipv4Addr, ttl: u32) -> Record {
         Name::from_ascii(name).expect("record name"),
         ttl,
         RData::A(A::new(a, b, c, d)),
+    )
+}
+
+fn cname_record(name: &str, target: &str) -> Record {
+    Record::from_rdata(
+        Name::from_ascii(name).expect("record name"),
+        300,
+        RData::CNAME(CNAME(Name::from_ascii(target).expect("cname target"))),
     )
 }
 
@@ -357,6 +376,48 @@ async fn recurses_through_delegations_and_maps_negative_answers() {
     .await;
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert!(response.answers.is_empty());
+    assert_eq!(
+        response
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .count(),
+        1
+    );
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("alias.sub.example.", RecordType::AAAA),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.answers.iter().any(|record| {
+        matches!(
+            &record.data,
+            RData::CNAME(target) if target.0 == Name::from_ascii("nodata.sub.example.").expect("cname target")
+        )
+    }));
+    assert_eq!(
+        response
+            .authorities
+            .iter()
+            .filter(|record| record.record_type() == RecordType::SOA)
+            .count(),
+        1
+    );
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("alias-missing.sub.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+    assert!(response.answers.iter().any(|record| {
+        matches!(
+            &record.data,
+            RData::CNAME(target) if target.0 == Name::from_ascii("missing.sub.example.").expect("cname target")
+        )
+    }));
     assert_eq!(
         response
             .authorities

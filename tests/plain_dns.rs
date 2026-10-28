@@ -627,7 +627,7 @@ async fn tcp_keepalive_is_included_in_tcp_responses() {
     match keepalive {
         EdnsOption::Unknown(code, value) => {
             assert_eq!(*code, u16::from(EdnsCode::Keepalive));
-            assert_eq!(u16::from_be_bytes([value[0], value[1]]), 10);
+            assert_eq!(u16::from_be_bytes([value[0], value[1]]), 100);
         }
         other => panic!("unexpected keepalive option: {other:?}"),
     }
