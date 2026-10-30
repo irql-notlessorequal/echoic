@@ -136,9 +136,8 @@ mod tests {
                 .expect("read listener TOS"),
             180
         );
-        let client = tokio::spawn(async move {
-            TcpStream::connect(bound_address).await.expect("connect")
-        });
+        let client =
+            tokio::spawn(async move { TcpStream::connect(bound_address).await.expect("connect") });
         let (stream, _) = listener.accept().await.expect("accept connection");
         let client_stream = client.await.expect("client completed");
         drop(client_stream);
