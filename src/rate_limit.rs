@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::net::{IpAddr, Ipv4Addr};
+
+use crate::net::normalize_ip;
 use std::num::NonZeroU32;
 
 use governor::clock::DefaultClock;
@@ -28,18 +30,15 @@ pub enum RateKey {
 
 impl From<IpAddr> for RateKey {
     fn from(address: IpAddr) -> Self {
-        match address {
+        match normalize_ip(address) {
             IpAddr::V4(address) => Self::V4(address),
-            IpAddr::V6(address) => match address.to_ipv4_mapped() {
-                Some(address) => Self::V4(address),
-                None => {
-                    let octets = address.octets();
-                    Self::V6(u64::from_be_bytes([
-                        octets[0], octets[1], octets[2], octets[3], octets[4], octets[5],
-                        octets[6], octets[7],
-                    ]))
-                }
-            },
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                Self::V6(u64::from_be_bytes([
+                    octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6],
+                    octets[7],
+                ]))
+            }
         }
     }
 }

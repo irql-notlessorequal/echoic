@@ -14,9 +14,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hickory_server::proto::op::Message;
@@ -115,10 +119,21 @@ pub struct PersistentDnsCache {
     memory: Cache<CacheKey, CacheEntry>,
     config: CacheConfig,
     path: Option<PathBuf>,
-    dirty: AtomicBool,
+    generation: AtomicU64,
+    flushed: AtomicU64,
+    io_lock: Mutex<()>,
 }
 
+static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl PersistentDnsCache {
+    pub async fn open(config: &CacheConfig) -> Self {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || Self::new(&config))
+            .await
+            .expect("persistent cache load task failed")
+    }
+
     pub fn new(config: &CacheConfig) -> Self {
         let memory = Cache::builder()
             .max_capacity(config.max_entries)
@@ -129,7 +144,9 @@ impl PersistentDnsCache {
             memory,
             config: config.clone(),
             path: config.path.clone(),
-            dirty: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            flushed: AtomicU64::new(0),
+            io_lock: Mutex::new(()),
         };
 
         if config.persistent {
@@ -175,31 +192,51 @@ impl PersistentDnsCache {
 
         self.memory.insert(key, entry);
         if self.config.persistent {
-            self.dirty.store(true, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&self) -> io::Result<()> {
+        let _guard = self
+            .io_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.memory.invalidate_all();
-        self.dirty.store(false, Ordering::Relaxed);
-        if self.config.persistent
+        let result = if self.config.persistent
             && let Some(path) = &self.path
+            && path.exists()
         {
-            let _ = fs::remove_file(path);
+            fs::remove_file(path)
+        } else {
+            Ok(())
+        };
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if result.is_ok() {
+            self.flushed.store(generation, Ordering::Relaxed);
         }
+        result
     }
 
     pub fn config(&self) -> &crate::config::CacheConfig {
         &self.config
     }
 
-    pub fn flush(&self) {
-        if !self.config.persistent || !self.dirty.swap(false, Ordering::Relaxed) {
-            return;
+    pub fn flush(&self) -> io::Result<()> {
+        if !self.config.persistent {
+            return Ok(());
+        }
+
+        let _guard = self
+            .io_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let generation = self.generation.load(Ordering::Relaxed);
+        if generation == self.flushed.load(Ordering::Relaxed) {
+            return Ok(());
         }
 
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
 
         let mut entries = Vec::new();
@@ -216,13 +253,9 @@ impl PersistentDnsCache {
             });
         }
 
-        let payload = match serde_json::to_vec(&PersistedCache { entries }) {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(error = %error, "failed to serialize persistent cache");
-                return;
-            }
-        };
+        let payload = serde_json::to_vec(&PersistedCache { entries }).map_err(|error| {
+            io::Error::other(format!("failed to serialize persistent cache: {error}"))
+        })?;
 
         let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + 8 + payload.len());
         bytes.extend_from_slice(MAGIC);
@@ -230,17 +263,37 @@ impl PersistentDnsCache {
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
 
-        let temp_path = path.with_extension("tmp");
-        if let Err(error) = fs::write(&temp_path, bytes) {
-            warn!(error = %error, "failed to write persistent cache");
-            return;
+        let temp_path = unique_sibling(path, "tmp");
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-        if let Err(error) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
-            warn!(error = %error, "failed to set persistent cache permissions");
-        }
-        if let Err(error) = fs::rename(&temp_path, path) {
-            warn!(error = %error, "failed to replace persistent cache");
-        }
+        result?;
+        self.flushed.store(generation, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub async fn flush_async(self: &Arc<Self>) -> io::Result<()> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.flush())
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    pub async fn clear_async(self: &Arc<Self>) -> io::Result<()> {
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || cache.clear())
+            .await
+            .map_err(io::Error::other)?
     }
 
     fn load(&self) {
@@ -385,9 +438,22 @@ fn zero_ttl_message(message: &Message) -> Message {
     message
 }
 
-fn quarantine_corrupt(path: &std::path::Path) {
-    let corrupt = path.with_extension("corrupt");
-    let _ = std::fs::remove_file(&corrupt);
+fn unique_sibling(path: &Path, extension: &str) -> PathBuf {
+    let counter = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cache".to_string());
+    path.with_file_name(format!(
+        "{name}.{}.{}.{}",
+        std::process::id(),
+        counter,
+        extension
+    ))
+}
+
+fn quarantine_corrupt(path: &Path) {
+    let corrupt = unique_sibling(path, "corrupt");
     let _ = std::fs::rename(path, corrupt);
 }
 
@@ -484,12 +550,82 @@ mod tests {
             dnssec_ok: false,
         };
         cache.insert(key.clone(), message(), SystemTime::now());
-        cache.flush();
+        cache.flush().unwrap();
 
         let reloaded = PersistentDnsCache::new(&cfg);
         let (cached, stale) = reloaded.get(&key, SystemTime::now()).unwrap();
         assert!(!stale);
         assert!(cached.answers.is_empty());
+    }
+
+    #[test]
+    fn flush_failure_keeps_data_retryable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::create_dir(&path).unwrap();
+        let cfg = config(true, true, Some(path.clone()));
+        let cache = PersistentDnsCache::new(&cfg);
+        let key = CacheKey {
+            name: Name::from_ascii("example.com.").unwrap(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        cache.insert(key.clone(), message(), SystemTime::now());
+
+        assert!(cache.flush().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        cache.flush().unwrap();
+
+        let reloaded = PersistentDnsCache::new(&cfg);
+        assert!(reloaded.get(&key, SystemTime::now()).is_some());
+    }
+
+    #[test]
+    fn clear_removes_flushed_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let cfg = config(true, true, Some(path.clone()));
+        let cache = PersistentDnsCache::new(&cfg);
+        let key = CacheKey {
+            name: Name::from_ascii("example.com.").unwrap(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        cache.insert(key.clone(), message(), SystemTime::now());
+        cache.flush().unwrap();
+
+        cache.clear().unwrap();
+        assert!(!path.exists());
+        assert!(cache.get(&key, SystemTime::now()).is_none());
+        assert!(cache.flush().is_ok());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let cfg = config(true, false, Some(path.clone()));
+        let cache = PersistentDnsCache::new(&cfg);
+        cache.insert(
+            CacheKey {
+                name: Name::from_ascii("example.com.").unwrap(),
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                dnssec_ok: false,
+            },
+            message(),
+            SystemTime::now(),
+        );
+        cache.flush().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
@@ -507,6 +643,37 @@ mod tests {
             dnssec_ok: false,
         };
         assert!(cache.get(&key, SystemTime::now()).is_none());
-        assert!(path.with_extension("corrupt").exists());
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".corrupt"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn repeated_corruption_keeps_each_quarantined_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let cfg = config(true, false, Some(path.clone()));
+
+        for _ in 0..2 {
+            std::fs::write(&path, b"not json").unwrap();
+            let _cache = PersistentDnsCache::new(&cfg);
+        }
+
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".corrupt")
+            })
+            .count();
+        assert_eq!(quarantined, 2);
     }
 }

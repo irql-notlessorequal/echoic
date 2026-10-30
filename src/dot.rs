@@ -45,8 +45,6 @@ pub async fn start_dot_listener(
     listener: &ListenerConfig,
     service: QueryService,
     tls_state: Arc<TlsState>,
-    _handshake_timeout: Duration,
-    _idle_timeout: Duration,
 ) -> Result<ListenerRuntime> {
     let max_connections = listener
         .limits
@@ -119,21 +117,15 @@ pub async fn start_dot_listener(
                     let token = task_token.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        handle_connection(
-                            tcp_stream,
-                            src_addr,
-                            service,
-                            tls_state,
-                            _handshake_timeout,
-                            _idle_timeout,
-                            token,
-                        )
-                        .await;
+                        handle_connection(tcp_stream, src_addr, service, tls_state, token).await;
                     });
                 }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::debug!(listener = %listener_name, error = %error, "DoT connection task failed");
+                    }
+                }
             }
-
-            while connections.try_join_next().is_some() {}
         }
 
         while connections.join_next().await.is_some() {}
@@ -156,13 +148,15 @@ pub async fn start_dot_listener(
     })
 }
 
+fn empty_queries() -> Queries {
+    Queries::read(&mut BinDecoder::new(&[]), 0).expect("empty query set decodes")
+}
+
 async fn handle_connection(
     tcp_stream: TcpStream,
     src_addr: SocketAddr,
     service: Arc<QueryService>,
     tls_state: Arc<TlsState>,
-    _handshake_timeout: Duration,
-    _idle_timeout: Duration,
     token: CancellationToken,
 ) {
     let tls_stream = match tokio::time::timeout(
@@ -182,14 +176,15 @@ async fn handle_connection(
         }
     };
 
+    let require_dot_alpn = service.state().load().require_dot_alpn;
     match tls_stream.get_ref().1.alpn_protocol() {
         Some(b"dot") => {}
-        None if !service.state().load().require_dot_alpn => {}
+        None if !require_dot_alpn => {}
         other => {
             tracing::debug!(
                 src = %src_addr,
                 alpn = ?other,
-                require_dot_alpn = service.state().load().require_dot_alpn,
+                require_dot_alpn,
                 "DoT connection rejected due to ALPN"
             );
             return;
@@ -236,7 +231,7 @@ async fn handle_connection(
                 let mut decoder = BinDecoder::new(&message_bytes);
                 if let Ok(header) = Header::read(&mut decoder) {
                     let queries = Queries::read(&mut decoder, header.counts.queries as usize)
-                        .unwrap_or_else(|_| Queries::read(&mut BinDecoder::new(&[]), 0).unwrap());
+                        .unwrap_or_else(|_| empty_queries());
                     let response_handle = ResponseHandle::new(
                         message_src,
                         stream_handle.clone(),

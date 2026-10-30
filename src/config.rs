@@ -25,6 +25,7 @@ use serde::Deserialize;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::error::ConfigError;
+use crate::net::normalize_ip;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/echoic/echoic.toml";
 
@@ -150,7 +151,6 @@ impl Config {
         self.validate_recursor(&mut errors);
         self.validate_dnssec(&mut errors);
         self.validate_server_limits(&mut errors);
-        self.validate_policy(&mut errors);
         self.validate_blocklist(&mut errors);
         self.validate_cache(&mut errors);
         self.validate_landing_page(&mut errors);
@@ -188,6 +188,8 @@ impl Config {
 
     fn validate_listeners(&self, errors: &mut Vec<String>) {
         let mut names = HashSet::new();
+        let mut endpoints = HashSet::new();
+
         for listener in &self.listeners {
             if listener.require_dot_alpn && listener.protocol != Protocol::Dot {
                 errors.push(format!(
@@ -201,11 +203,6 @@ impl Config {
                     listener.name
                 ));
             }
-        }
-
-        let mut endpoints = HashSet::new();
-
-        for listener in &self.listeners {
             if listener.name.is_empty() {
                 errors.push("listener name must not be empty".to_owned());
             }
@@ -355,9 +352,6 @@ impl Config {
         if self.recursor.ns_recursion_limit == 0 {
             errors.push("recursor.ns_recursion_limit must be greater than zero".to_owned());
         }
-        if self.recursor.ns_recursion_limit == 0 {
-            errors.push("recursor.ns_recursion_limit must be greater than zero".to_owned());
-        }
         if !(512..=4096).contains(&self.recursor.edns_payload_len) {
             errors.push("recursor.edns_payload_len must be between 512 and 4096".to_owned());
         }
@@ -388,19 +382,6 @@ impl Config {
                 "dnssec.nsec3_soft_iteration_limit must not exceed nsec3_hard_iteration_limit"
                     .to_owned(),
             );
-        }
-    }
-
-    fn validate_policy(&self, errors: &mut Vec<String>) {
-        if let Some(prefix) = self.policy.edns_client_subnet_v4_prefix
-            && !(1..=32).contains(&prefix)
-        {
-            errors.push("policy.edns_client_subnet_v4_prefix must be between 1 and 32".to_owned());
-        }
-        if let Some(prefix) = self.policy.edns_client_subnet_v6_prefix
-            && !(1..=128).contains(&prefix)
-        {
-            errors.push("policy.edns_client_subnet_v6_prefix must be between 1 and 128".to_owned());
         }
     }
 
@@ -599,13 +580,7 @@ pub struct AclConfig {
 
 impl AclConfig {
     pub fn is_allowed(&self, address: IpAddr, protocol: Protocol) -> bool {
-        let address = match address {
-            IpAddr::V6(address) => address
-                .to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(address)),
-            address => address,
-        };
+        let address = normalize_ip(address);
         if self.deny.iter().any(|network| network.contains(&address)) {
             return false;
         }
@@ -708,19 +683,11 @@ fn default_log_level() -> String {
 pub struct PolicyConfig {
     #[serde(default = "default_true")]
     pub refuse_any: bool,
-    #[serde(default)]
-    pub edns_client_subnet_v4_prefix: Option<u8>,
-    #[serde(default)]
-    pub edns_client_subnet_v6_prefix: Option<u8>,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self {
-            refuse_any: true,
-            edns_client_subnet_v4_prefix: None,
-            edns_client_subnet_v6_prefix: None,
-        }
+        Self { refuse_any: true }
     }
 }
 
@@ -832,7 +799,7 @@ impl Default for RecursorConfig {
             ns_cache_size: DEFAULT_NS_CACHE_SIZE,
             recursion_limit: DEFAULT_RECURSION_LIMIT,
             ns_recursion_limit: DEFAULT_RECURSION_LIMIT,
-            qname_minimization: QNameMinimization::Strict,
+            qname_minimization: QNameMinimization::Relaxed,
             case_randomization: true,
             edns_payload_len: DEFAULT_EDNS_PAYLOAD_LEN,
         }
@@ -842,8 +809,8 @@ impl Default for RecursorConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QNameMinimization {
-    #[default]
     Strict,
+    #[default]
     Relaxed,
 }
 
@@ -1053,6 +1020,52 @@ address = "127.0.0.1:5353"
             Config::from_toml_str(&config),
             Err(ConfigError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_removed_ecs_keys() {
+        let config = r#"
+[policy]
+edns_client_subnet_v4_prefix = 24
+"#;
+        assert!(matches!(
+            Config::from_toml_str(config),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn defaults_to_relaxed_qname_minimization() {
+        let config = Config::from_toml_str(
+            r#"
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        )
+        .expect("default configuration");
+        assert_eq!(
+            config.recursor.qname_minimization,
+            QNameMinimization::Relaxed
+        );
+    }
+
+    #[test]
+    fn reports_zero_ns_recursion_limit_once() {
+        let message = validation_message(
+            r#"
+[recursor]
+ns_recursion_limit = 0
+"#,
+        );
+        assert_eq!(
+            message
+                .matches("recursor.ns_recursion_limit must be greater than zero")
+                .count(),
+            1,
+            "{message}"
+        );
     }
 
     #[test]

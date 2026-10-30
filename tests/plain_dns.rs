@@ -162,15 +162,13 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
     )
     .expect("rpz policy");
     let service = QueryService::new(
-        mock.clone(),
+        echoic::recursor::RecursorHandle::new(mock.clone()),
         listener,
         stats.clone(),
         Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(inflight)))),
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,
-        config.policy.edns_client_subnet_v4_prefix,
-        config.policy.edns_client_subnet_v6_prefix,
         blocklist,
     );
     let runtime = start_listener(listener, service, config.server_limits.query_timeout)
@@ -636,59 +634,7 @@ async fn tcp_keepalive_is_included_in_tcp_responses() {
 }
 
 #[tokio::test]
-async fn ecs_is_generated_when_enabled() {
-    let source = r#"
-[logging]
-level = "off"
-
-[policy]
-refuse_any = true
-edns_client_subnet_v4_prefix = 24
-edns_client_subnet_v6_prefix = 56
-
-[server_limits]
-max_udp_payload = 512
-query_timeout = "2s"
-
-[dnssec]
-enabled = false
-
-[[listeners]]
-name = "test"
-protocol = "udp"
-address = "127.0.0.1:0"
-"#;
-    let config = Config::from_toml_str(source).expect("config");
-    let server = start_config(&config, false, 16).await;
-    let address = server.runtime.bound_address;
-
-    let mut request = Message::query();
-    request.add_query(Query::query(
-        Name::from_ascii("example.com.").expect("name"),
-        RecordType::A,
-    ));
-    request.set_edns(Edns::new());
-
-    let response = udp_query(address, request).await;
-    let ecs = response
-        .edns
-        .as_ref()
-        .expect("response edns")
-        .option(EdnsCode::Subnet)
-        .expect("generated ecs");
-    match ecs {
-        EdnsOption::Subnet(client_subnet) => {
-            assert_eq!(client_subnet.source_prefix(), 24);
-            assert_eq!(client_subnet.scope_prefix(), 0);
-        }
-        other => panic!("unexpected ecs option: {other:?}"),
-    }
-
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn ecs_is_stripped_when_disabled() {
+async fn ecs_option_is_not_echoed() {
     let server = start(Protocol::Udp, false).await;
     let address = server.runtime.bound_address;
 
@@ -1349,6 +1295,77 @@ address = "127.0.0.1:0"
     txt_query.set_edns(Edns::new());
     let response = udp_query(address, txt_query).await;
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::TXT)
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn rpz_local_data_answers_any() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rpz_path = dir.path().join("block.rpz");
+    std::fs::write(
+        &rpz_path,
+        r#"
+$ORIGIN rpz.local.
+$TTL 300
+@ SOA localhost. root.localhost. 1 1h 15m 30d 2h
+  NS localhost.
+many.example.com A 192.0.2.50
+many.example.com TXT "blocked"
+"#,
+    )
+    .expect("write rpz");
+
+    let source = format!(
+        r#"
+[logging]
+level = "off"
+
+[policy]
+refuse_any = false
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+        rpz_path.display()
+    );
+    let config = Config::from_toml_str(&source).expect("config");
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut message = Message::query();
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(
+        Name::from_ascii("many.example.com.").expect("name"),
+        RecordType::ANY,
+    ));
+    message.set_edns(Edns::new());
+    let response = udp_query(address, message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|record| record.record_type() == RecordType::A)
+    );
     assert!(
         response
             .answers

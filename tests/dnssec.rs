@@ -571,15 +571,13 @@ async fn start_dnssec_server(validate: bool, ds_mode: DsResponseMode) -> DnssecS
     let resolver = build_recursor_with_provider(&config, provider).expect("build DNSSEC recursor");
     let stats = Arc::new(Stats::default());
     let service = QueryService::new(
-        resolver,
+        echoic::recursor::RecursorHandle::new(resolver),
         &config.listeners[0],
         stats.clone(),
         Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(16)))),
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,
-        config.policy.edns_client_subnet_v4_prefix,
-        config.policy.edns_client_subnet_v6_prefix,
         echoic::rpz::RpzPolicy::empty(),
     );
     let runtime = start_listener(

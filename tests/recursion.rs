@@ -39,6 +39,8 @@ use tokio::sync::Semaphore;
 const ROOT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const TLD_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 const AUTH_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 3);
+const PARENT_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 4);
+const CHILD_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 5);
 const ANSWER_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,8 @@ enum Role {
     Root,
     Tld,
     Auth,
+    DelegatedParent,
+    DelegatedChild,
 }
 
 #[derive(Clone, Default)]
@@ -61,6 +65,7 @@ impl Counters {
             Role::Root => &self.root,
             Role::Tld => &self.tld,
             Role::Auth => &self.auth,
+            Role::DelegatedParent | Role::DelegatedChild => return,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -70,6 +75,7 @@ impl Counters {
             Role::Root => &self.root,
             Role::Tld => &self.tld,
             Role::Auth => &self.auth,
+            Role::DelegatedParent | Role::DelegatedChild => return 0,
         };
         counter.load(Ordering::Relaxed)
     }
@@ -107,6 +113,10 @@ impl ConnectionProvider for MockProvider {
             Role::Tld
         } else if ip == IpAddr::V4(AUTH_IP) {
             Role::Auth
+        } else if ip == IpAddr::V4(PARENT_IP) {
+            Role::DelegatedParent
+        } else if ip == IpAddr::V4(CHILD_IP) {
+            Role::DelegatedChild
         } else {
             return Err(NetError::from(format!("unexpected mock server {ip}")));
         };
@@ -152,7 +162,18 @@ fn answer(role: Role, id: u16, query: &Query) -> Message {
     let name = query.name().to_string().to_ascii_lowercase();
     match role {
         Role::Root => referral(&mut response, "example.", "ns.example.", TLD_IP),
-        Role::Tld => referral(&mut response, "sub.example.", "ns.auth.example.", AUTH_IP),
+        Role::Tld => {
+            if name == "delegated.example." || name.ends_with(".delegated.example.") {
+                referral(
+                    &mut response,
+                    "delegated.example.",
+                    "ns.parent.example.",
+                    PARENT_IP,
+                );
+            } else {
+                referral(&mut response, "sub.example.", "ns.auth.example.", AUTH_IP);
+            }
+        }
         Role::Auth if query.query_type() == RecordType::NS => {
             response.metadata.authoritative = true;
         }
@@ -185,6 +206,38 @@ fn answer(role: Role, id: u16, query: &Query) -> Message {
                 response.metadata.authoritative = true;
                 response.metadata.response_code = ResponseCode::NXDomain;
                 response.add_authority(soa_record("sub.example."));
+            }
+        },
+        Role::DelegatedParent => match (name.as_str(), query.query_type()) {
+            ("web.delegated.example.", RecordType::NS) => {
+                response.metadata.authoritative = true;
+                response.metadata.response_code = ResponseCode::NXDomain;
+                response.add_authority(soa_record("delegated.example."));
+            }
+            ("na.web.delegated.example.", RecordType::NS) => {
+                referral(
+                    &mut response,
+                    "na.web.delegated.example.",
+                    "ns.child.delegated.example.",
+                    CHILD_IP,
+                );
+            }
+            _ => {
+                response.metadata.authoritative = true;
+            }
+        },
+        Role::DelegatedChild => match (name.as_str(), query.query_type()) {
+            ("na.web.delegated.example.", RecordType::A) => {
+                response.metadata.authoritative = true;
+                response.add_answer(a_record("na.web.delegated.example.", ANSWER_IP, 60));
+            }
+            (_, RecordType::NS) => {
+                response.metadata.authoritative = true;
+            }
+            _ => {
+                response.metadata.authoritative = true;
+                response.metadata.response_code = ResponseCode::NXDomain;
+                response.add_authority(soa_record("na.web.delegated.example."));
             }
         },
     }
@@ -246,7 +299,13 @@ impl RecursionServer {
     }
 }
 
-fn config_with_root_hints(root_hints: &std::path::Path) -> Config {
+fn config_with_root_hints(
+    root_hints: &std::path::Path,
+    qname_minimization: Option<&str>,
+) -> Config {
+    let qname_minimization = qname_minimization
+        .map(|value| format!("qname_minimization = \"{value}\"\n"))
+        .unwrap_or_default();
     let source = format!(
         r#"
 [logging]
@@ -258,7 +317,7 @@ enabled = false
 [recursor]
 root_hints = "{}"
 deny_server = []
-
+{qname_minimization}
 [[listeners]]
 name = "test"
 protocol = "udp"
@@ -270,6 +329,13 @@ address = "127.0.0.1:0"
 }
 
 async fn start_recursion_server(stats: Arc<Stats>) -> (RecursionServer, Counters) {
+    start_recursion_server_with_minimization(stats, None).await
+}
+
+async fn start_recursion_server_with_minimization(
+    stats: Arc<Stats>,
+    qname_minimization: Option<&str>,
+) -> (RecursionServer, Counters) {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root_hints = directory.path().join("root.hints");
     std::fs::write(
@@ -280,20 +346,18 @@ async fn start_recursion_server(stats: Arc<Stats>) -> (RecursionServer, Counters
     )
     .expect("write root hints");
 
-    let config = config_with_root_hints(&root_hints);
+    let config = config_with_root_hints(&root_hints, qname_minimization);
     let counters = Counters::default();
     let resolver = build_recursor_with_provider(&config, MockProvider::new(counters.clone()))
         .expect("build recursor");
     let service = QueryService::new(
-        resolver,
+        echoic::recursor::RecursorHandle::new(resolver),
         &config.listeners[0],
         stats.clone(),
         Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(16)))),
         &config.server_limits,
         config.policy.refuse_any,
         config.logging.query_names,
-        config.policy.edns_client_subnet_v4_prefix,
-        config.policy.edns_client_subnet_v6_prefix,
         echoic::rpz::RpzPolicy::empty(),
     );
     let runtime = start_listener(
@@ -461,6 +525,44 @@ async fn recursor_cache_hit_is_recorded_after_startup() {
     let snapshot = stats.snapshot();
     assert!(snapshot.cache_hits > 0);
     assert!(snapshot.cache_hits + snapshot.cache_misses > 0);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn relaxed_qname_minimization_resolves_beneath_intermediate_nxdomain() {
+    let stats = Arc::new(Stats::default());
+    let (server, _) = start_recursion_server(stats).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("na.web.delegated.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        response
+            .answers
+            .iter()
+            .any(|record| matches!(record.data, RData::A(address) if address.0 == ANSWER_IP))
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn strict_qname_minimization_trusts_intermediate_nxdomain() {
+    let stats = Arc::new(Stats::default());
+    let (server, _) = start_recursion_server_with_minimization(stats, Some("strict")).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("na.web.delegated.example.", RecordType::A),
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
 
     server.stop().await;
 }

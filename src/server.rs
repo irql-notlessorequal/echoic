@@ -27,7 +27,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, Protocol};
+use crate::config::{Config, EffectiveListenerLimits, Protocol};
 use crate::doh::{DohRuntimeState, start_doh_listener};
 use crate::dot::start_dot_listener;
 use crate::listeners::{ListenerRuntime, start_listener};
@@ -37,7 +37,7 @@ use crate::rate_limit::{KeyedRateLimiter, keyed_limiter};
 use crate::recursor::{CachedRecursiveResolver, RecursorHandle, build_recursor};
 use crate::rpz::RpzPolicy;
 use crate::stats::Stats;
-use crate::tls::TlsState;
+use crate::tls::{TlsState, install_crypto_provider};
 
 pub type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
@@ -80,7 +80,7 @@ pub async fn run_with_logging(
     config_path: Option<PathBuf>,
     logging_reload: Option<ReloadHandle>,
 ) -> anyhow::Result<()> {
-    install_ring_provider();
+    install_crypto_provider();
 
     let config_store = Arc::new(ArcSwap::from_pointee(config.clone()));
     let stats = Arc::new(Stats::default());
@@ -88,7 +88,7 @@ pub async fn run_with_logging(
         .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
     let cache_handle = Arc::new(ArcSwap::from_pointee(
         if config.cache.persistent || config.cache.serve_stale {
-            Some(Arc::new(PersistentDnsCache::new(&config.cache)))
+            Some(Arc::new(PersistentDnsCache::open(&config.cache).await))
         } else {
             None
         },
@@ -111,15 +111,13 @@ pub async fn run_with_logging(
     let mut runtimes: Vec<ListenerRuntime> = Vec::new();
     for listener in &config.listeners {
         let service = QueryService::new(
-            resolver_handle.current(),
+            resolver_handle.clone(),
             listener,
             stats.clone(),
             inflight_store.clone(),
             &config.server_limits,
             config.policy.refuse_any,
             config.logging.query_names,
-            config.policy.edns_client_subnet_v4_prefix,
-            config.policy.edns_client_subnet_v6_prefix,
             blocklist.clone(),
         );
 
@@ -130,18 +128,10 @@ pub async fn run_with_logging(
                 .iter()
                 .find(|tls| tls.name == tls_name)
                 .expect("validated tls");
-            let tls_state = TlsState::load(&tls_config.cert, &tls_config.key)
+            let tls_state = TlsState::load(&tls_config.cert, &tls_config.key, listener.protocol)
                 .with_context(|| format!("listener {:?}: failed to load TLS", listener.name))?;
             let tls_state = Arc::new(tls_state);
-            match start_dot_listener(
-                listener,
-                service,
-                tls_state.clone(),
-                config.server_limits.query_timeout,
-                config.server_limits.idle_timeout,
-            )
-            .await
-            {
+            match start_dot_listener(listener, service, tls_state.clone()).await {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     for runtime in &runtimes {
@@ -160,7 +150,7 @@ pub async fn run_with_logging(
                 .iter()
                 .find(|tls| tls.name == tls_name)
                 .expect("validated tls");
-            let tls_state = TlsState::load_doh(&tls_config.cert, &tls_config.key)
+            let tls_state = TlsState::load(&tls_config.cert, &tls_config.key, listener.protocol)
                 .with_context(|| format!("listener {:?}: failed to load TLS", listener.name))?;
             let tls_state = Arc::new(tls_state);
             let max_concurrent_requests = listener
@@ -187,8 +177,6 @@ pub async fn run_with_logging(
                 landing_html,
                 landing_css,
                 ready.clone(),
-                config.server_limits.query_timeout,
-                config.server_limits.query_timeout,
             )
             .await
             {
@@ -243,8 +231,10 @@ pub async fn run_with_logging(
                     _ = token.cancelled() => break,
                     _ = tokio::time::sleep(delay) => {}
                 }
-                if let Some(cache) = cache_handle.load_full().as_deref() {
-                    cache.flush();
+                if let Some(cache) = cache_handle.load_full().as_ref().clone()
+                    && let Err(error) = cache.flush_async().await
+                {
+                    tracing::warn!(error = %error, "failed to flush persistent cache");
                 }
             }
         }
@@ -315,8 +305,10 @@ pub async fn run_with_logging(
     cache_flush_token.cancel();
     cache_flush_task.abort();
     let _ = cache_flush_task.await;
-    if let Some(cache) = cache_handle.load_full().as_deref() {
-        cache.flush();
+    if let Some(cache) = cache_handle.load_full().as_ref().clone()
+        && let Err(error) = cache.flush_async().await
+    {
+        tracing::warn!(error = %error, "failed to flush persistent cache");
     }
     reload_task.abort();
     let _ = reload_task.await;
@@ -361,15 +353,6 @@ pub async fn run_with_logging(
     tracing::info!(?snapshot, "echoic stopped");
 
     Ok(())
-}
-
-fn install_ring_provider() {
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        tracing::debug!("rustls crypto provider was already installed");
-    }
 }
 
 fn spawn_rate_limiter_cleanup(
@@ -447,34 +430,31 @@ async fn reload_once(
 
     let current_config = ctx.config.load_full();
     let new_config = Config::load(config_path)?;
-    let new_filter = build_filter(&new_config)?;
+    let new_filter = build_filter(&new_config.logging)?;
 
     let recursor_settings_changed =
         recursor_signature(&current_config) != recursor_signature(&new_config);
     let cache_changed = current_config.cache != new_config.cache;
     let recursor_changed = recursor_settings_changed || cache_changed;
 
-    if (cache_changed || recursor_settings_changed)
-        && let Some(cache) = ctx.cache_handle.load_full().as_deref()
-    {
-        cache.clear();
-    }
-
-    if cache_changed {
-        let new_cache = if new_config.cache.persistent || new_config.cache.serve_stale {
-            Some(Arc::new(PersistentDnsCache::new(&new_config.cache)))
+    let new_cache = if cache_changed {
+        if new_config.cache.persistent || new_config.cache.serve_stale {
+            Some(Arc::new(PersistentDnsCache::open(&new_config.cache).await))
         } else {
             None
-        };
-        ctx.cache_handle.store(Arc::new(new_cache));
-    }
+        }
+    } else {
+        None
+    };
+    let new_cache_handle =
+        cache_changed.then(|| Arc::new(ArcSwap::from_pointee(new_cache.as_ref().map(Arc::clone))));
 
     let new_resolver = if recursor_changed {
         let base = build_recursor(&new_config)?;
-        Some(Arc::new(CachedRecursiveResolver::new(
-            base,
-            ctx.cache_handle.clone(),
-        )))
+        let cache_handle = new_cache_handle
+            .clone()
+            .unwrap_or_else(|| ctx.cache_handle.clone());
+        Some(Arc::new(CachedRecursiveResolver::new(base, cache_handle)))
     } else {
         None
     };
@@ -484,147 +464,179 @@ async fn reload_once(
         new_config.blocklist.rpz_origin.as_deref(),
     )?;
 
-    let mut new_tls_states = HashMap::new();
-    for tls in &new_config.tls {
-        let mut alpn = Vec::new();
-        if new_config.listeners.iter().any(|listener| {
-            listener.tls.as_deref() == Some(tls.name.as_str()) && listener.protocol == Protocol::Dot
-        }) {
-            alpn.push(b"dot".to_vec());
-        }
-        if new_config.listeners.iter().any(|listener| {
-            listener.tls.as_deref() == Some(tls.name.as_str()) && listener.protocol == Protocol::Doh
-        }) {
-            alpn.push(b"h2".to_vec());
-            alpn.push(b"http/1.1".to_vec());
-        }
-        if alpn.is_empty() {
-            alpn.push(b"dot".to_vec());
-        }
-        new_tls_states.insert(
-            tls.name.clone(),
-            Arc::new(TlsState::load_with_alpn(&tls.cert, &tls.key, alpn)?),
-        );
-    }
+    let has_doh = new_config
+        .listeners
+        .iter()
+        .any(|listener| listener.protocol == Protocol::Doh);
+    let (landing_html, landing_css) = if has_doh {
+        (
+            new_config
+                .landing_page
+                .read_html()
+                .with_context(|| "failed to read landing page HTML")?,
+            new_config
+                .landing_page
+                .read_css()
+                .with_context(|| "failed to read landing page CSS")?,
+        )
+    } else {
+        (None, None)
+    };
 
-    let old_listeners = current_config.listeners.clone();
-    let old_runtimes = ctx.runtimes.lock().unwrap();
-    let mut listener_changes = false;
-    let mut updates = Vec::new();
+    let new_paths = watched_paths(&new_config, config_path);
+    let (new_watcher, new_watched) = build_watcher(&new_paths, tx)?;
 
-    for new_listener in &new_config.listeners {
-        let old_runtime = old_runtimes.iter().find(|runtime| {
-            runtime.name == new_listener.name
-                && runtime.protocol == new_listener.protocol
-                && runtime.address == new_listener.address
-        });
+    let (updates, listener_changes) = {
+        let old_runtimes = ctx.runtimes.lock().unwrap();
+        let mut listener_changes = false;
+        let mut updates = Vec::new();
+        let mut tls_states: HashMap<(String, Protocol), Arc<TlsState>> = HashMap::new();
 
-        if old_runtime.is_none() {
-            tracing::warn!(
-                listener = %new_listener.name,
-                "listener added or identity changed; restart required"
-            );
-            listener_changes = true;
-            continue;
-        }
-
-        let limits = new_listener.limits.effective(new_listener.protocol);
-        let rate_limiter = keyed_limiter(limits.qps, limits.burst);
-        let state = ListenerQueryState {
-            acl: Arc::new(new_listener.acl.clone()),
-            rate_limiter: Arc::new(rate_limiter),
-            refuse_any: new_config.policy.refuse_any,
-            max_udp_payload: new_config.server_limits.max_udp_payload,
-            query_timeout: new_config.server_limits.query_timeout,
-            idle_timeout: new_config.server_limits.idle_timeout,
-            query_names: new_config.logging.query_names,
-            require_dot_alpn: new_listener.require_dot_alpn,
-            edns_padding_block_size: new_listener.edns_padding_block_size(),
-            client_subnet_v4_prefix: new_config.policy.edns_client_subnet_v4_prefix,
-            client_subnet_v6_prefix: new_config.policy.edns_client_subnet_v6_prefix,
-            blocklist: new_blocklist.clone(),
-        };
-        let query_state = Arc::new(state);
-
-        let tls_state = new_listener
-            .tls
-            .as_ref()
-            .and_then(|name| new_tls_states.get(name).cloned());
-
-        let dot_max_connections = if new_listener.protocol == Protocol::Dot {
-            let max_connections = limits.max_connections.unwrap_or(512) as usize;
-            Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
-                max_connections,
-            )))))
-        } else {
-            None
-        };
-
-        let doh_runtime = if new_listener.protocol == Protocol::Doh {
-            let max_concurrent_requests = limits.max_concurrent_requests.unwrap_or(128) as usize;
-            let landing_html = match new_config.landing_page.read_html() {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(error = %error, "failed to read landing page HTML during reload; using default");
-                    None
-                }
+        for new_listener in &new_config.listeners {
+            let old_runtime = old_runtimes.iter().find(|runtime| {
+                runtime.name == new_listener.name
+                    && runtime.protocol == new_listener.protocol
+                    && runtime.address == new_listener.address
+            });
+            let Some(old_runtime) = old_runtime else {
+                tracing::warn!(
+                    listener = %new_listener.name,
+                    "listener added or identity changed; restart required"
+                );
+                listener_changes = true;
+                continue;
             };
-            let landing_css = match new_config.landing_page.read_css() {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(error = %error, "failed to read landing page CSS during reload; using default");
-                    None
-                }
-            };
-            Some(Arc::new(ArcSwap::from_pointee(DohRuntimeState {
-                hostname: new_listener.hostname.clone().unwrap_or_default(),
-                max_concurrent_requests,
-                max_doh_body: new_config.server_limits.max_doh_body,
-                max_doh_uri: new_config.server_limits.max_doh_uri,
-                tcp_notsent_lowat: new_listener.tcp_notsent_lowat(),
-                concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
-                landing_html,
-                landing_css,
-            })))
-        } else {
-            None
-        };
 
-        let doh_max_connections = if new_listener.protocol == Protocol::Doh {
-            let max_connections = limits.max_connections.unwrap_or(512) as usize;
-            Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
-                max_connections,
-            )))))
-        } else {
-            None
-        };
+            let old_listener = current_config.listeners.iter().find(|listener| {
+                listener.name == new_listener.name
+                    && listener.protocol == new_listener.protocol
+                    && listener.address == new_listener.address
+            });
+            let old_limits =
+                old_listener.map(|listener| listener.limits.effective(listener.protocol));
+            let limits = new_listener.limits.effective(new_listener.protocol);
 
-        updates.push(ListenerUpdate {
-            name: new_listener.name.clone(),
-            protocol: new_listener.protocol,
-            address: new_listener.address,
-            query_state,
-            tls_state,
-            dot_max_connections,
-            doh_runtime,
-            doh_max_connections,
-        });
-    }
-
-    for old_listener in &old_listeners {
-        let still_present = new_config.listeners.iter().any(|listener| {
-            listener.name == old_listener.name
-                && listener.protocol == old_listener.protocol
-                && listener.address == old_listener.address
-        });
-        if !still_present {
-            tracing::warn!(
-                listener = %old_listener.name,
-                "listener removed or identity changed; restart required"
+            let rate_limiter = select_rate_limiter(
+                old_limits,
+                Some(old_runtime.query_state.load().rate_limiter.clone()),
+                &limits,
             );
-            listener_changes = true;
+
+            let state = ListenerQueryState {
+                acl: Arc::new(new_listener.acl.clone()),
+                rate_limiter,
+                refuse_any: new_config.policy.refuse_any,
+                max_udp_payload: new_config.server_limits.max_udp_payload,
+                query_timeout: new_config.server_limits.query_timeout,
+                idle_timeout: new_config.server_limits.idle_timeout,
+                query_names: new_config.logging.query_names,
+                require_dot_alpn: new_listener.require_dot_alpn,
+                edns_padding_block_size: new_listener.edns_padding_block_size(),
+                blocklist: new_blocklist.clone(),
+            };
+
+            let tls_state = if let Some(tls_name) = &new_listener.tls {
+                let key = (tls_name.clone(), new_listener.protocol);
+                if let Some(state) = tls_states.get(&key) {
+                    Some(state.clone())
+                } else {
+                    let tls_config = new_config
+                        .tls
+                        .iter()
+                        .find(|tls| tls.name == *tls_name)
+                        .expect("validated tls");
+                    let state = Arc::new(
+                        TlsState::load(&tls_config.cert, &tls_config.key, new_listener.protocol)
+                            .with_context(|| {
+                                format!("listener {:?}: failed to load TLS", new_listener.name)
+                            })?,
+                    );
+                    tls_states.insert(key, state.clone());
+                    Some(state)
+                }
+            } else {
+                None
+            };
+
+            let dot_max_connections = if new_listener.protocol == Protocol::Dot
+                && old_limits.is_none_or(|old| old.max_connections != limits.max_connections)
+            {
+                let max_connections = limits.max_connections.unwrap_or(512) as usize;
+                Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
+                    max_connections,
+                )))))
+            } else {
+                None
+            };
+
+            let doh_runtime = if new_listener.protocol == Protocol::Doh {
+                let max_concurrent_requests =
+                    limits.max_concurrent_requests.unwrap_or(128) as usize;
+                let concurrency = old_runtime
+                    .doh_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.load_full())
+                    .filter(|runtime| {
+                        old_limits.is_some_and(|old| {
+                            old.max_concurrent_requests == limits.max_concurrent_requests
+                        }) && runtime.max_concurrent_requests == max_concurrent_requests
+                    })
+                    .map(|runtime| runtime.concurrency.clone())
+                    .unwrap_or_else(|| Arc::new(Semaphore::new(max_concurrent_requests)));
+                Some(Arc::new(ArcSwap::from_pointee(DohRuntimeState {
+                    hostname: new_listener.hostname.clone().unwrap_or_default(),
+                    max_concurrent_requests,
+                    max_doh_body: new_config.server_limits.max_doh_body,
+                    max_doh_uri: new_config.server_limits.max_doh_uri,
+                    tcp_notsent_lowat: new_listener.tcp_notsent_lowat(),
+                    concurrency,
+                    landing_html: landing_html.clone(),
+                    landing_css: landing_css.clone(),
+                })))
+            } else {
+                None
+            };
+
+            let doh_max_connections = if new_listener.protocol == Protocol::Doh
+                && old_limits.is_none_or(|old| old.max_connections != limits.max_connections)
+            {
+                let max_connections = limits.max_connections.unwrap_or(512) as usize;
+                Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
+                    max_connections,
+                )))))
+            } else {
+                None
+            };
+
+            updates.push(ListenerUpdate {
+                name: new_listener.name.clone(),
+                protocol: new_listener.protocol,
+                address: new_listener.address,
+                query_state: Arc::new(state),
+                tls_state,
+                dot_max_connections,
+                doh_runtime,
+                doh_max_connections,
+            });
         }
-    }
+
+        for old_listener in &current_config.listeners {
+            let still_present = new_config.listeners.iter().any(|listener| {
+                listener.name == old_listener.name
+                    && listener.protocol == old_listener.protocol
+                    && listener.address == old_listener.address
+            });
+            if !still_present {
+                tracing::warn!(
+                    listener = %old_listener.name,
+                    "listener removed or identity changed; restart required"
+                );
+                listener_changes = true;
+            }
+        }
+
+        (updates, listener_changes)
+    };
 
     let new_inflight = if new_config.server_limits.max_inflight_queries
         != current_config.server_limits.max_inflight_queries
@@ -642,20 +654,29 @@ async fn reload_once(
             .map_err(|error| anyhow::anyhow!("failed to reload logging: {error}"))?;
     }
 
-    let new_paths = watched_paths(
-        &new_config,
-        ctx.config_path.as_ref().expect("configuration path"),
-    );
-    let (new_watcher, new_watched) = build_watcher(&new_paths, tx.clone())?;
+    if cache_changed {
+        if let Some(cache) = &new_cache
+            && let Err(error) = cache.clear_async().await
+        {
+            tracing::warn!(error = %error, "failed to clear persistent cache");
+        }
+        ctx.cache_handle.store(Arc::new(new_cache));
+    } else if recursor_settings_changed
+        && let Some(cache) = ctx.cache_handle.load_full().as_ref().clone()
+        && let Err(error) = cache.clear_async().await
+    {
+        tracing::warn!(error = %error, "failed to clear persistent cache");
+    }
 
-    ctx.config.store(Arc::new(new_config.clone()));
     if let Some(resolver) = new_resolver {
         ctx.resolver.store(resolver);
     }
     if let Some(inflight) = new_inflight {
         ctx.inflight.store(Arc::new(inflight));
     }
-    drop(old_runtimes);
+
+    ctx.config.store(Arc::new(new_config));
+
     let mut old_runtimes = ctx.runtimes.lock().unwrap();
     for update in &updates {
         if let Some(runtime) = old_runtimes.iter_mut().find(|runtime| {
@@ -665,38 +686,28 @@ async fn reload_once(
         }) {
             runtime.query_state.store(update.query_state.clone());
             runtime.tls_state.store(Arc::new(update.tls_state.clone()));
-            if let Some(max_connections) = &update.dot_max_connections {
-                if let Some(existing) = &runtime.dot_max_connections {
-                    existing.store(max_connections.load().clone());
-                } else {
-                    runtime.dot_max_connections = Some(max_connections.clone());
-                }
+            if let Some(max_connections) = &update.dot_max_connections
+                && let Some(existing) = &runtime.dot_max_connections
+            {
+                existing.store(max_connections.load().clone());
             }
-            if let Some(doh_runtime) = &update.doh_runtime {
-                if let Some(existing) = &runtime.doh_runtime {
-                    existing.store(doh_runtime.load().clone());
-                } else {
-                    runtime.doh_runtime = Some(doh_runtime.clone());
-                }
+            if let Some(doh_runtime) = &update.doh_runtime
+                && let Some(existing) = &runtime.doh_runtime
+            {
+                existing.store(doh_runtime.load_full());
             }
-            if let Some(max_connections) = &update.doh_max_connections {
-                if let Some(existing) = &runtime.doh_max_connections {
-                    existing.store(max_connections.load().clone());
-                } else {
-                    runtime.doh_max_connections = Some(max_connections.clone());
-                }
+            if let Some(max_connections) = &update.doh_max_connections
+                && let Some(existing) = &runtime.doh_max_connections
+            {
+                existing.store(max_connections.load().clone());
             }
         }
     }
-    drop(old_runtimes);
-
-    let new_limiters: Vec<_> = ctx
-        .runtimes
-        .lock()
-        .unwrap()
+    let new_limiters: Vec<_> = old_runtimes
         .iter()
         .map(|runtime| runtime.query_state.load().rate_limiter.clone())
         .collect();
+    drop(old_runtimes);
     ctx.limiters.store(Arc::new(new_limiters));
 
     if listener_changes {
@@ -706,22 +717,29 @@ async fn reload_once(
     Ok((new_watcher, new_watched))
 }
 
-fn build_filter(config: &Config) -> anyhow::Result<EnvFilter> {
-    let mut directives = vec![config.logging.level.clone()];
-    if config.logging.level != "off" {
-        let hickory_level = if config.logging.query_names {
-            "info"
-        } else {
-            "warn"
-        };
-        for target in [
-            "hickory_server",
-            "hickory_resolver",
-            "hickory_proto",
-            "hickory_net",
-        ] {
+fn select_rate_limiter(
+    old_limits: Option<EffectiveListenerLimits>,
+    old_limiter: Option<Arc<KeyedRateLimiter>>,
+    new_limits: &EffectiveListenerLimits,
+) -> Arc<KeyedRateLimiter> {
+    if let (Some(old_limits), Some(old_limiter)) = (old_limits, old_limiter)
+        && old_limits.qps == new_limits.qps
+        && old_limits.burst == new_limits.burst
+    {
+        return old_limiter;
+    }
+    Arc::new(keyed_limiter(new_limits.qps, new_limits.burst))
+}
+
+pub fn build_filter(logging: &crate::config::LoggingConfig) -> anyhow::Result<EnvFilter> {
+    let mut directives = vec![logging.level.clone()];
+    if logging.level != "off" {
+        let hickory_level = if logging.query_names { "info" } else { "warn" };
+        for target in ["hickory_server", "hickory_proto", "hickory_net"] {
             directives.push(format!("{target}={hickory_level}"));
         }
+        let resolver_level = if logging.query_names { "info" } else { "error" };
+        directives.push(format!("hickory_resolver={resolver_level}"));
     }
 
     EnvFilter::try_new(directives.join(","))
@@ -880,7 +898,7 @@ address = "127.0.0.1:0"
             dnssec_ok: false,
         };
         cache.insert(key.clone(), Message::query(), SystemTime::now());
-        cache.flush();
+        cache.flush().expect("flush cache");
         assert!(cache.get(&key, SystemTime::now()).is_some());
 
         let inflight = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(1))));
@@ -908,6 +926,229 @@ address = "127.0.0.1:0"
         let reloaded_cache = reloaded_loaded.as_ref().as_ref().expect("cache");
         assert!(reloaded_cache.get(&key, SystemTime::now()).is_none());
         assert!(!cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_reload_preserves_old_state() {
+        let directory = tempdir().expect("temporary directory");
+        let config_path = directory.path().join("echoic.toml");
+        let cache_path = directory.path().join("cache.json");
+        let rpz_path = directory.path().join("missing.rpz");
+
+        let initial = format!(
+            r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = false
+
+[cache]
+persistent = true
+path = "{}"
+max_entries = 100
+flush_interval = "1h"
+max_ttl = "1h"
+stale_ttl = "1h"
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+            cache_path.display()
+        );
+        std::fs::write(&config_path, &initial).expect("write configuration");
+        let config = Config::load(&config_path).expect("load configuration");
+
+        let cache_handle = Arc::new(ArcSwap::from_pointee(Some(Arc::new(
+            PersistentDnsCache::new(&config.cache),
+        ))));
+        let base = build_recursor(&config).expect("build recursor");
+        let resolver = RecursorHandle::new(Arc::new(CachedRecursiveResolver::new(
+            base,
+            cache_handle.clone(),
+        )));
+        let key = CacheKey {
+            name: Name::from_ascii("example.com.").expect("name"),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        {
+            let loaded = cache_handle.load_full();
+            let cache = loaded.as_ref().as_ref().expect("cache");
+            cache.insert(key.clone(), Message::query(), SystemTime::now());
+            cache.flush().expect("flush cache");
+        }
+
+        let inflight = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(1))));
+        let runtimes = Arc::new(Mutex::new(Vec::new()));
+        let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = ReloadContext {
+            config: Arc::new(ArcSwap::from_pointee(config.clone())),
+            config_path: Some(config_path.clone()),
+            resolver: resolver.clone(),
+            cache_handle: cache_handle.clone(),
+            inflight: inflight.clone(),
+            runtimes: runtimes.clone(),
+            logging_reload: None,
+            limiters: limiters.clone(),
+        };
+
+        let updated = format!(
+            r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = true
+
+[cache]
+persistent = true
+path = "{}"
+max_entries = 101
+flush_interval = "1h"
+max_ttl = "1h"
+stale_ttl = "1h"
+
+[blocklist]
+rpz_paths = ["{}"]
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+            cache_path.display(),
+            rpz_path.display()
+        );
+        std::fs::write(&config_path, updated).expect("write configuration");
+
+        let before_cache = cache_handle.load_full();
+        let error = reload_once(&ctx, tx).await.expect_err("reload must fail");
+        let _ = error;
+        assert!(!resolver.is_validating());
+        assert!(!ctx.config.load().dnssec.validate);
+        assert!(Arc::ptr_eq(&before_cache, &cache_handle.load_full()));
+        let loaded = cache_handle.load_full();
+        let cache = loaded.as_ref().as_ref().expect("cache");
+        assert!(cache.get(&key, SystemTime::now()).is_some());
+        assert!(cache_path.exists());
+    }
+
+    #[tokio::test]
+    async fn disabling_cache_replaces_the_cache_handle() {
+        let directory = tempdir().expect("temporary directory");
+        let config_path = directory.path().join("echoic.toml");
+        let cache_path = directory.path().join("cache.json");
+
+        let initial = format!(
+            r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = false
+
+[cache]
+persistent = true
+path = "{}"
+max_entries = 100
+flush_interval = "1h"
+max_ttl = "1h"
+stale_ttl = "1h"
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#,
+            cache_path.display()
+        );
+        std::fs::write(&config_path, &initial).expect("write configuration");
+        let config = Config::load(&config_path).expect("load configuration");
+
+        let cache_handle = Arc::new(ArcSwap::from_pointee(Some(Arc::new(
+            PersistentDnsCache::new(&config.cache),
+        ))));
+        let base = build_recursor(&config).expect("build recursor");
+        let resolver = RecursorHandle::new(Arc::new(CachedRecursiveResolver::new(
+            base,
+            cache_handle.clone(),
+        )));
+        let inflight = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(1))));
+        let runtimes = Arc::new(Mutex::new(Vec::new()));
+        let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctx = ReloadContext {
+            config: Arc::new(ArcSwap::from_pointee(config)),
+            config_path: Some(config_path.clone()),
+            resolver: resolver.clone(),
+            cache_handle: cache_handle.clone(),
+            inflight,
+            runtimes,
+            logging_reload: None,
+            limiters,
+        };
+        assert!(cache_handle.load().is_some());
+
+        let updated = r#"
+[logging]
+level = "off"
+
+[dnssec]
+enabled = true
+validate = false
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#;
+        std::fs::write(&config_path, updated).expect("write configuration");
+
+        reload_once(&ctx, tx).await.expect("reload");
+
+        assert!(ctx.cache_handle.load().is_none());
+    }
+
+    #[test]
+    fn logging_filter_matches_startup_policy() {
+        let mut logging = crate::config::LoggingConfig {
+            level: "info".to_owned(),
+            query_names: false,
+        };
+        let filter = build_filter(&logging).expect("filter");
+        let rendered = filter.to_string();
+        assert!(rendered.contains("hickory_resolver=error"), "{rendered}");
+        assert!(rendered.contains("hickory_server=warn"), "{rendered}");
+
+        logging.query_names = true;
+        let filter = build_filter(&logging).expect("filter");
+        let rendered = filter.to_string();
+        assert!(rendered.contains("hickory_resolver=info"), "{rendered}");
+        assert!(rendered.contains("hickory_server=info"), "{rendered}");
+    }
+
+    #[test]
+    fn unchanged_limits_reuse_rate_limiter() {
+        let old_limits =
+            crate::config::ListenerLimits::default().effective(crate::config::Protocol::Udp);
+        let limiter = Arc::new(keyed_limiter(old_limits.qps, old_limits.burst));
+        let reused = select_rate_limiter(Some(old_limits), Some(limiter.clone()), &old_limits);
+        assert!(Arc::ptr_eq(&limiter, &reused));
+
+        let changed = crate::config::EffectiveListenerLimits {
+            qps: old_limits.qps + 1,
+            ..old_limits
+        };
+        let replaced = select_rate_limiter(Some(old_limits), Some(limiter.clone()), &changed);
+        assert!(!Arc::ptr_eq(&limiter, &replaced));
     }
 }
 

@@ -13,8 +13,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
@@ -22,24 +21,36 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
 use tokio_rustls::TlsAcceptor;
 
+use crate::config::Protocol;
+
+pub fn install_crypto_provider() {
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!("rustls crypto provider was already installed");
+    }
+}
+
+pub fn alpn_for_protocol(protocol: Protocol) -> Vec<Vec<u8>> {
+    match protocol {
+        Protocol::Dot => vec![b"dot".to_vec()],
+        Protocol::Doh => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        Protocol::Udp | Protocol::Tcp => Vec::new(),
+    }
+}
+
 pub struct TlsState {
-    cert_path: PathBuf,
-    key_path: PathBuf,
-    alpn: Vec<Vec<u8>>,
-    current: RwLock<Arc<ServerConfig>>,
+    acceptor: TlsAcceptor,
 }
 
 impl TlsState {
-    pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with_alpn(cert_path, key_path, vec![b"dot".to_vec()])
-    }
-
-    pub fn load_doh(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
-        Self::load_with_alpn(
-            cert_path,
-            key_path,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        )
+    pub fn load(
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        protocol: Protocol,
+    ) -> Result<Self> {
+        Self::load_with_alpn(cert_path, key_path, alpn_for_protocol(protocol))
     }
 
     pub fn load_with_alpn(
@@ -47,33 +58,14 @@ impl TlsState {
         key_path: impl AsRef<Path>,
         alpn: Vec<Vec<u8>>,
     ) -> Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert_path = cert_path.as_ref().to_path_buf();
-        let key_path = key_path.as_ref().to_path_buf();
-        let config = load_server_config(&cert_path, &key_path, alpn.clone())?;
+        let config = load_server_config(cert_path.as_ref(), key_path.as_ref(), alpn)?;
         Ok(Self {
-            cert_path,
-            key_path,
-            alpn,
-            current: RwLock::new(config),
+            acceptor: TlsAcceptor::from(config),
         })
     }
 
-    pub fn current(&self) -> Arc<ServerConfig> {
-        self.current
-            .read()
-            .expect("tls state lock poisoned")
-            .clone()
-    }
-
     pub fn acceptor(&self) -> TlsAcceptor {
-        TlsAcceptor::from(self.current())
-    }
-
-    pub fn reload(&self) -> Result<()> {
-        let config = load_server_config(&self.cert_path, &self.key_path, self.alpn.clone())?;
-        *self.current.write().expect("tls state lock poisoned") = config;
-        Ok(())
+        self.acceptor.clone()
     }
 }
 
@@ -81,8 +73,7 @@ pub fn load_server_config(
     cert_path: &Path,
     key_path: &Path,
     alpn: Vec<Vec<u8>>,
-) -> Result<Arc<ServerConfig>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+) -> Result<std::sync::Arc<ServerConfig>> {
     use rustls::pki_types::CertificateDer;
 
     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
@@ -113,5 +104,5 @@ pub fn load_server_config(
 
     config.alpn_protocols = alpn;
 
-    Ok(Arc::new(config))
+    Ok(std::sync::Arc::new(config))
 }

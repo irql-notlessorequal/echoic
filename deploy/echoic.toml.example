@@ -4,8 +4,6 @@ query_names = false
 
 [policy]
 refuse_any = true
-# edns_client_subnet_v4_prefix = 24
-# edns_client_subnet_v6_prefix = 56
 
 [[tls]]
 name = "public"
@@ -59,7 +57,7 @@ response_cache_size = 1048576
 ns_cache_size = 1024
 recursion_limit = 24
 ns_recursion_limit = 24
-qname_minimization = "strict"
+qname_minimization = "relaxed"
 case_randomization = true
 edns_payload_len = 1232
 

@@ -19,7 +19,6 @@ use clap::Parser;
 use echoic::cli::Cli;
 use echoic::config::{Config, LoggingConfig};
 use echoic::server::ReloadHandle;
-use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 fn main() -> ExitCode {
@@ -54,21 +53,7 @@ fn run() -> anyhow::Result<()> {
 }
 
 fn init_logging(logging: &LoggingConfig) -> anyhow::Result<ReloadHandle> {
-    logging.level_filter()?;
-
-    let mut directives = vec![logging.level.clone()];
-    if logging.level != "off" {
-        let hickory_level = if logging.query_names { "info" } else { "warn" };
-        for target in ["hickory_server", "hickory_proto", "hickory_net"] {
-            directives.push(format!("{target}={hickory_level}"));
-        }
-        let resolver_level = if logging.query_names { "info" } else { "error" };
-        directives.push(format!("hickory_resolver={resolver_level}"));
-    }
-
-    let filter = EnvFilter::try_new(directives.join(","))
-        .map_err(|error| anyhow::anyhow!("failed to build logging filter: {error}"))?;
-
+    let filter = echoic::server::build_filter(logging)?;
     let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .json()

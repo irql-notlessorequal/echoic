@@ -30,7 +30,16 @@ pub enum RpzAction {
     Drop,
     TcpOnly,
     Redirect(Name, u32),
-    LocalData(Vec<Record>),
+    LocalData(Arc<[Record]>),
+}
+
+fn merge_local_data(existing: &mut RpzAction, action: RpzAction) {
+    if let (RpzAction::LocalData(existing), RpzAction::LocalData(new)) = (existing, action) {
+        let mut records = Vec::with_capacity(existing.len() + new.len());
+        records.extend(existing.iter().cloned());
+        records.extend(new.iter().cloned());
+        *existing = Arc::from(records);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,12 +80,12 @@ impl RpzPolicy {
             .parse()
             .map_err(|error| anyhow::anyhow!("failed to parse RPZ {}: {error}", path.display()))?;
 
+            let origin_lower = LowerName::new(&parsed_origin);
+            let origin_name = origin_lower.to_string();
+
             for (key, record_set) in records {
                 let owner = key.name;
-                let origin_lower = LowerName::new(&parsed_origin);
-
                 let owner_name = owner.to_string();
-                let origin_name = parsed_origin.to_string();
                 let trigger_name = if owner == origin_lower {
                     ".".to_string()
                 } else if parsed_origin == Name::root() {
@@ -89,6 +98,13 @@ impl RpzPolicy {
                             origin_name
                         )
                     })?;
+                    if !stripped.ends_with('.') {
+                        return Err(anyhow::anyhow!(
+                            "RPZ owner {} is not under origin {}",
+                            owner_name,
+                            origin_name
+                        ));
+                    }
                     stripped.to_string()
                 };
 
@@ -123,7 +139,7 @@ impl RpzPolicy {
                         RpzAction::Redirect(target, cname_ttl)
                     }
                 } else if !local_data.is_empty() {
-                    RpzAction::LocalData(local_data)
+                    RpzAction::LocalData(Arc::from(local_data))
                 } else {
                     continue;
                 };
@@ -133,23 +149,33 @@ impl RpzPolicy {
                 })?;
 
                 if let Some(stripped) = trigger_name.strip_prefix("*.") {
-                    let suffix = LowerName::from_str(stripped).map_err(|error| {
-                        anyhow::anyhow!("invalid RPZ wildcard {trigger_name}: {error}")
-                    })?;
-                    if !wildcards.iter().any(|(existing, _)| existing == &suffix) {
+                    let suffix = if stripped.is_empty() {
+                        LowerName::new(&Name::root())
+                    } else {
+                        LowerName::from_str(stripped).map_err(|error| {
+                            anyhow::anyhow!("invalid RPZ wildcard {trigger_name}: {error}")
+                        })?
+                    };
+                    if let Some((_, existing)) = wildcards
+                        .iter_mut()
+                        .find(|(existing, _)| existing == &suffix)
+                    {
+                        merge_local_data(existing, action);
+                    } else {
                         wildcards.push((suffix, action));
                     }
+                } else if let Some(existing) = exact.get_mut(&trigger) {
+                    merge_local_data(existing, action);
                 } else {
-                    exact.entry(trigger).or_insert(action);
+                    exact.insert(trigger, action);
                 }
             }
         }
 
         wildcards.sort_by(|(left, _), (right, _)| {
-            let left_labels = left.to_string().matches('.').count();
-            let right_labels = right.to_string().matches('.').count();
-            right_labels
-                .cmp(&left_labels)
+            right
+                .num_labels()
+                .cmp(&left.num_labels())
                 .then_with(|| right.to_string().len().cmp(&left.to_string().len()))
         });
 
@@ -163,13 +189,7 @@ impl RpzPolicy {
         }
 
         for (suffix, action) in &self.wildcards {
-            let name = lower.to_string();
-            let suffix = suffix.to_string();
-            if name != suffix
-                && name.len() > suffix.len()
-                && name.ends_with(&suffix)
-                && name.as_bytes()[name.len() - suffix.len() - 1] == b'.'
-            {
+            if *suffix != lower && suffix.zone_of(&lower) {
                 return Some(action.clone());
             }
         }
@@ -179,3 +199,68 @@ impl RpzPolicy {
 }
 
 use std::str::FromStr;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_policy(contents: &str) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.rpz");
+        std::fs::write(&path, contents).unwrap();
+        (dir, vec![path])
+    }
+
+    #[test]
+    fn origin_requires_a_label_boundary() {
+        let (_dir, paths) = write_policy(
+            r#"
+$ORIGIN example.com.
+@ 300 SOA localhost. root.localhost. 1 1h 15m 30d 2h
+@ NS localhost.
+notexample.com. CNAME rpz-passthru.
+"#,
+        );
+
+        assert!(RpzPolicy::load(&paths, None).is_err());
+    }
+
+    #[test]
+    fn root_wildcard_matches_names_outside_the_origin() {
+        let (_dir, paths) = write_policy(
+            r#"
+$ORIGIN rpz.local.
+@ 300 SOA localhost. root.localhost. 1 1h 15m 30d 2h
+@ NS localhost.
+* CNAME rpz-drop.
+"#,
+        );
+
+        let policy = RpzPolicy::load(&paths, None).unwrap();
+        let name = Name::from_ascii("example.net.").unwrap();
+        assert!(matches!(policy.evaluate(&name), Some(RpzAction::Drop)));
+    }
+
+    #[test]
+    fn wildcard_match_respects_label_boundaries() {
+        let (_dir, paths) = write_policy(
+            r#"
+$ORIGIN rpz.local.
+@ 300 SOA localhost. root.localhost. 1 1h 15m 30d 2h
+@ NS localhost.
+*.example.com.rpz.local. CNAME rpz-drop.
+"#,
+        );
+
+        let policy = RpzPolicy::load(&paths, None).unwrap();
+        assert!(matches!(
+            policy.evaluate(&Name::from_ascii("a.example.com.").unwrap()),
+            Some(RpzAction::Drop)
+        ));
+        assert!(
+            policy
+                .evaluate(&Name::from_ascii("notexample.com.").unwrap())
+                .is_none()
+        );
+    }
+}

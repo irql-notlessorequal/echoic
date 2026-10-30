@@ -8,7 +8,6 @@ Supporting features like...
 - DNS over HTTPS
 - DNSSEC
 - EDNS TCP Keepalive (RFC 7828)
-- EDNS Client Subnet (RFC 7871)
 - EDNS Padding (RFC 7830)
 - Extended DNS Errors (RFC 8914)
 - Memory caching

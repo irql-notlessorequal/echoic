@@ -27,14 +27,15 @@ use hickory_server::proto::op::{
     Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode,
 };
 use hickory_server::proto::rr::rdata::SOA;
-use hickory_server::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_server::proto::rr::{DNSClass, Name, Record, RecordType};
 use hickory_server::resolver::recursor::RecursorError;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::{MessageResponseBuilder, Queries};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
+use crate::net::normalize_ip;
 use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
 use crate::recursor::{RecursiveResolver, RecursorHandle};
 use crate::stats::Stats;
@@ -83,6 +84,13 @@ fn rpz_extended_dns_error(action: &crate::rpz::RpzAction) -> Option<ExtendedDnsE
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionError {
+    AclDenied,
+    RateLimited,
+    Overloaded,
+}
+
 #[derive(Clone)]
 pub struct ListenerQueryState {
     pub acl: Arc<AclConfig>,
@@ -94,9 +102,20 @@ pub struct ListenerQueryState {
     pub query_names: bool,
     pub require_dot_alpn: bool,
     pub edns_padding_block_size: usize,
-    pub client_subnet_v4_prefix: Option<u8>,
-    pub client_subnet_v6_prefix: Option<u8>,
     pub blocklist: Arc<crate::rpz::RpzPolicy>,
+}
+
+fn padding_requested(request: &Request, state: &ListenerQueryState) -> bool {
+    state.edns_padding_block_size != 0
+        && request
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.option(EdnsCode::Padding).is_some())
+}
+
+fn padding_len(state: &ListenerQueryState, base_len: usize) -> usize {
+    let block_size = state.edns_padding_block_size;
+    (block_size - ((base_len + 4) % block_size)) % block_size
 }
 
 pub struct QueryService {
@@ -111,15 +130,13 @@ pub struct QueryService {
 impl QueryService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        resolver: Arc<dyn RecursiveResolver>,
+        resolver: RecursorHandle,
         listener: &ListenerConfig,
         stats: Arc<Stats>,
         inflight: Arc<ArcSwap<Arc<Semaphore>>>,
         server_limits: &ServerLimits,
         refuse_any: bool,
         query_names: bool,
-        client_subnet_v4_prefix: Option<u8>,
-        client_subnet_v6_prefix: Option<u8>,
         blocklist: Arc<crate::rpz::RpzPolicy>,
     ) -> Self {
         let limits = listener.limits.effective(listener.protocol);
@@ -133,13 +150,11 @@ impl QueryService {
             query_names,
             require_dot_alpn: listener.require_dot_alpn,
             edns_padding_block_size: listener.edns_padding_block_size(),
-            client_subnet_v4_prefix,
-            client_subnet_v6_prefix,
             blocklist,
         };
 
         Self {
-            resolver: RecursorHandle::new(resolver),
+            resolver,
             listener_name: listener.name.clone(),
             protocol: listener.protocol,
             state: Arc::new(ArcSwap::from_pointee(state)),
@@ -184,14 +199,6 @@ impl QueryService {
         self.state.load().edns_padding_block_size
     }
 
-    pub fn client_subnet_v4_prefix(&self) -> Option<u8> {
-        self.state.load().client_subnet_v4_prefix
-    }
-
-    pub fn client_subnet_v6_prefix(&self) -> Option<u8> {
-        self.state.load().client_subnet_v6_prefix
-    }
-
     pub fn blocklist(&self) -> Arc<crate::rpz::RpzPolicy> {
         self.state.load().blocklist.clone()
     }
@@ -212,18 +219,67 @@ impl QueryService {
         self.stats.clone()
     }
 
+    pub fn snapshot(&self) -> Arc<ListenerQueryState> {
+        self.state.load_full()
+    }
+
+    pub fn admit(
+        &self,
+        source: IpAddr,
+        state: &ListenerQueryState,
+    ) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        let inflight = self.inflight();
+        self.admit_with(source, state, inflight)
+    }
+
+    pub fn admit_with(
+        &self,
+        source: IpAddr,
+        state: &ListenerQueryState,
+        inflight: Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        let source = normalize_ip(source);
+        if !state.acl.is_allowed(source, self.protocol) {
+            self.stats.record_acl_denied();
+            return Err(AdmissionError::AclDenied);
+        }
+        if state
+            .rate_limiter
+            .check_key(&RateKey::from(source))
+            .is_err()
+        {
+            self.stats.record_rate_limited();
+            return Err(AdmissionError::RateLimited);
+        }
+        match inflight.try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(_) => {
+                self.stats.record_overloaded();
+                Err(AdmissionError::Overloaded)
+            }
+        }
+    }
+
     async fn reject<R: ResponseHandler>(
         &self,
         request: &Request,
         response_handle: R,
         response_code: ResponseCode,
+        state: &ListenerQueryState,
         started: Instant,
     ) -> ResponseInfo {
         if self.protocol == Protocol::Udp {
             drop_response(request)
         } else {
-            self.send_status(request, response_handle, response_code, None, started)
-                .await
+            self.send_status(
+                request,
+                response_handle,
+                response_code,
+                None,
+                state,
+                started,
+            )
+            .await
         }
     }
 
@@ -234,40 +290,27 @@ impl QueryService {
         mut response_handle: R,
         response_code: ResponseCode,
         extended_error: Option<ExtendedDnsError>,
+        state: &ListenerQueryState,
         started: Instant,
     ) -> ResponseInfo {
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = response_code;
 
-        let mut edns = response_edns(
-            request,
-            self.max_udp_payload(),
-            self.protocol,
-            self.idle_timeout(),
-            self.client_subnet_v4_prefix(),
-            self.client_subnet_v6_prefix(),
-            extended_error,
-        );
+        let mut edns = response_edns(request, state, self.protocol, extended_error);
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
-        let measurement =
-            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
-        let mut measurement_bytes = Vec::with_capacity(512);
-        let mut measurement_encoder =
-            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-        let _ = measurement.destructive_emit(&mut measurement_encoder);
-        let base_len = measurement_bytes.len();
-
-        let block_size = self.edns_padding_block_size();
-        if block_size != 0
-            && let Some(request_edns) = request.edns.as_ref()
-            && request_edns.option(EdnsCode::Padding).is_some()
+        if padding_requested(request, state)
             && let Some(edns) = &mut edns
         {
-            edns.options_mut().remove(EdnsCode::Padding);
-            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns))
+                .build_no_records(metadata);
+            let mut measurement_bytes = Vec::with_capacity(512);
+            let mut measurement_encoder =
+                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+            let _ = measurement.destructive_emit(&mut measurement_encoder);
+            let pad_len = padding_len(state, measurement_bytes.len());
             edns.options_mut().insert(EdnsOption::Unknown(
                 EdnsCode::Padding.into(),
                 vec![0; pad_len],
@@ -279,7 +322,7 @@ impl QueryService {
 
         match response_handle.send_response(response).await {
             Ok(info) => {
-                self.record_response(request, response_code, started, false);
+                self.record_response(request, response_code, state, started, false);
                 info
             }
             Err(error) => {
@@ -300,9 +343,11 @@ impl QueryService {
         mut response_handle: R,
         mut message: hickory_server::proto::op::Message,
         extended_error: Option<ExtendedDnsError>,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
     ) -> ResponseInfo {
-        if self.validating() {
+        if validating {
             if message_is_bogus(&message) {
                 let answer_types = bogus_record_types(&message.answers);
                 let authority_types = bogus_record_types(&message.authorities);
@@ -318,6 +363,7 @@ impl QueryService {
                         response_handle,
                         ResponseCode::ServFail,
                         Some(ExtendedDnsError::DnssecBogus),
+                        state,
                         started,
                     )
                     .await;
@@ -344,46 +390,32 @@ impl QueryService {
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = response_code;
-        metadata.authentic_data = self.validating()
+        metadata.authentic_data = validating
             && matches!(
                 response_code,
                 ResponseCode::NoError | ResponseCode::NXDomain
             )
             && message_is_secure(&message);
 
-        let mut edns = response_edns(
-            request,
-            self.max_udp_payload(),
-            self.protocol,
-            self.idle_timeout(),
-            self.client_subnet_v4_prefix(),
-            self.client_subnet_v6_prefix(),
-            extended_error,
-        );
+        let mut edns = response_edns(request, state, self.protocol, extended_error);
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
-        let measurement = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
-            metadata,
-            &message.answers,
-            &message.authorities,
-            iter::empty::<&Record>(),
-            &message.additionals,
-        );
-        let mut measurement_bytes = Vec::with_capacity(512);
-        let mut measurement_encoder =
-            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-        let _ = measurement.destructive_emit(&mut measurement_encoder);
-        let base_len = measurement_bytes.len();
-
-        let block_size = self.edns_padding_block_size();
-        if block_size != 0
-            && let Some(request_edns) = request.edns.as_ref()
-            && request_edns.option(EdnsCode::Padding).is_some()
+        if padding_requested(request, state)
             && let Some(edns) = &mut edns
         {
-            edns.options_mut().remove(EdnsCode::Padding);
-            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns)).build(
+                metadata,
+                &message.answers,
+                &message.authorities,
+                iter::empty::<&Record>(),
+                &message.additionals,
+            );
+            let mut measurement_bytes = Vec::with_capacity(512);
+            let mut measurement_encoder =
+                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+            let _ = measurement.destructive_emit(&mut measurement_encoder);
+            let pad_len = padding_len(state, measurement_bytes.len());
             edns.options_mut().insert(EdnsOption::Unknown(
                 EdnsCode::Padding.into(),
                 vec![0; pad_len],
@@ -400,7 +432,13 @@ impl QueryService {
 
         match response_handle.send_response(response).await {
             Ok(info) => {
-                self.record_response(request, response_code, started, metadata.authentic_data);
+                self.record_response(
+                    request,
+                    response_code,
+                    state,
+                    started,
+                    metadata.authentic_data,
+                );
                 info
             }
             Err(error) => {
@@ -419,6 +457,8 @@ impl QueryService {
         request: &Request,
         mut response_handle: R,
         negative: NegativeResponse,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
     ) -> ResponseInfo {
         let NegativeResponse {
@@ -427,45 +467,31 @@ impl QueryService {
             soa,
             secure,
         } = negative;
-        let authentic_data = self.validating() && secure;
+        let authentic_data = validating && secure;
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
         metadata.response_code = response_code;
         metadata.authentic_data = authentic_data;
 
-        let mut edns = response_edns(
-            request,
-            self.max_udp_payload(),
-            self.protocol,
-            self.idle_timeout(),
-            self.client_subnet_v4_prefix(),
-            self.client_subnet_v6_prefix(),
-            None,
-        );
+        let mut edns = response_edns(request, state, self.protocol, None);
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
         }
-        let measurement = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
-            metadata,
-            iter::empty::<&Record>(),
-            authorities.iter(),
-            soa.iter(),
-            iter::empty::<&Record>(),
-        );
-        let mut measurement_bytes = Vec::with_capacity(512);
-        let mut measurement_encoder =
-            hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-        let _ = measurement.destructive_emit(&mut measurement_encoder);
-        let base_len = measurement_bytes.len();
-
-        let block_size = self.edns_padding_block_size();
-        if block_size != 0
-            && let Some(request_edns) = request.edns.as_ref()
-            && request_edns.option(EdnsCode::Padding).is_some()
+        if padding_requested(request, state)
             && let Some(edns) = &mut edns
         {
-            edns.options_mut().remove(EdnsCode::Padding);
-            let pad_len = (block_size - ((base_len + 4) % block_size)) % block_size;
+            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns)).build(
+                metadata,
+                iter::empty::<&Record>(),
+                authorities.iter(),
+                soa.iter(),
+                iter::empty::<&Record>(),
+            );
+            let mut measurement_bytes = Vec::with_capacity(512);
+            let mut measurement_encoder =
+                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
+            let _ = measurement.destructive_emit(&mut measurement_encoder);
+            let pad_len = padding_len(state, measurement_bytes.len());
             edns.options_mut().insert(EdnsOption::Unknown(
                 EdnsCode::Padding.into(),
                 vec![0; pad_len],
@@ -482,7 +508,7 @@ impl QueryService {
 
         match response_handle.send_response(response).await {
             Ok(info) => {
-                self.record_response(request, response_code, started, authentic_data);
+                self.record_response(request, response_code, state, started, authentic_data);
                 info
             }
             Err(error) => {
@@ -504,44 +530,11 @@ impl QueryService {
         response_handle: R,
         started: Instant,
     ) -> ResponseInfo {
-        let source_ip = normalize_ip(source.ip());
-
-        if !self.acl().is_allowed(source_ip, self.protocol) {
-            self.stats.record_acl_denied();
-            return self
-                .send_simple(
-                    source,
-                    header,
-                    &queries,
-                    response_handle,
-                    ResponseCode::Refused,
-                    started,
-                )
-                .await;
-        }
-
-        if self
-            .rate_limiter()
-            .check_key(&RateKey::from(source_ip))
-            .is_err()
-        {
-            self.stats.record_rate_limited();
-            return self
-                .send_simple(
-                    source,
-                    header,
-                    &queries,
-                    response_handle,
-                    ResponseCode::Refused,
-                    started,
-                )
-                .await;
-        }
-
-        let _permit = match self.inflight().try_acquire_owned() {
+        let state = self.snapshot();
+        let _permit = match self.admit(source.ip(), &state) {
             Ok(permit) => permit,
+            Err(_) if self.protocol == Protocol::Udp => return drop_simple(&header),
             Err(_) => {
-                self.stats.record_overloaded();
                 return self
                     .send_simple(
                         source,
@@ -549,6 +542,7 @@ impl QueryService {
                         &queries,
                         response_handle,
                         ResponseCode::Refused,
+                        &state,
                         started,
                     )
                     .await;
@@ -561,11 +555,13 @@ impl QueryService {
             &queries,
             response_handle,
             ResponseCode::FormErr,
+            &state,
             started,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_simple<R: ResponseHandler>(
         &self,
         source: std::net::SocketAddr,
@@ -573,6 +569,7 @@ impl QueryService {
         queries: &Queries,
         mut response_handle: R,
         response_code: ResponseCode,
+        state: &ListenerQueryState,
         started: Instant,
     ) -> ResponseInfo {
         let mut metadata = header.metadata;
@@ -592,7 +589,7 @@ impl QueryService {
 
                 let elapsed_ms = started.elapsed().as_millis();
                 let query = queries.queries().first();
-                if self.query_names() {
+                if state.query_names {
                     tracing::debug!(
                         listener = %self.listener_name,
                         protocol = self.protocol.as_str(),
@@ -640,6 +637,7 @@ impl QueryService {
         mut response_handle: R,
         response_code: ResponseCode,
         extended_error: Option<ExtendedDnsError>,
+        state: &ListenerQueryState,
         started: Instant,
     ) -> ResponseInfo {
         let mut metadata = Metadata::response_from_request(&request.metadata);
@@ -647,21 +645,13 @@ impl QueryService {
         metadata.response_code = response_code;
         metadata.truncation = true;
 
-        let edns = response_edns(
-            request,
-            self.max_udp_payload(),
-            self.protocol,
-            self.idle_timeout(),
-            self.client_subnet_v4_prefix(),
-            self.client_subnet_v6_prefix(),
-            extended_error,
-        );
+        let edns = response_edns(request, state, self.protocol, extended_error);
         let response =
             MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
 
         match response_handle.send_response(response).await {
             Ok(info) => {
-                self.record_response(request, response_code, started, false);
+                self.record_response(request, response_code, state, started, false);
                 info
             }
             Err(error) => {
@@ -683,13 +673,15 @@ impl QueryService {
         query: &hickory_server::proto::op::Query,
         target: Name,
         ttl: u32,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
         dnssec_ok: bool,
     ) -> ResponseInfo {
         let target_query =
             hickory_server::proto::op::Query::query(target.clone(), query.query_type());
         let target_response = match tokio::time::timeout(
-            self.query_timeout(),
+            state.query_timeout,
             self.resolver().resolve(target_query, dnssec_ok),
         )
         .await
@@ -702,6 +694,7 @@ impl QueryService {
                         response_handle,
                         ResponseCode::ServFail,
                         None,
+                        state,
                         started,
                     )
                     .await;
@@ -724,23 +717,29 @@ impl QueryService {
             query,
             answers,
             target_response.metadata.response_code,
+            state,
+            validating,
             started,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_rpz_local_data<R: ResponseHandler>(
         &self,
         request: &Request,
         response_handle: R,
         query: &hickory_server::proto::op::Query,
-        records: Vec<Record>,
+        records: Arc<[Record]>,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
-        _dnssec_ok: bool,
     ) -> ResponseInfo {
         let matching: Vec<Record> = records
-            .into_iter()
-            .filter(|record| record.record_type() == query.query_type())
+            .iter()
+            .filter(|record| {
+                query.query_type() == RecordType::ANY || record.record_type() == query.query_type()
+            })
             .map(|record| Record::from_rdata(query.name().clone(), record.ttl, record.data.clone()))
             .collect();
 
@@ -751,6 +750,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::NoError,
                     Some(ExtendedDnsError::Blocked),
+                    state,
                     started,
                 )
                 .await;
@@ -762,11 +762,14 @@ impl QueryService {
             query,
             matching,
             ResponseCode::NoError,
+            state,
+            validating,
             started,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_rpz_message<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -774,6 +777,8 @@ impl QueryService {
         query: &hickory_server::proto::op::Query,
         answers: Vec<Record>,
         response_code: ResponseCode,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
     ) -> ResponseInfo {
         let mut message =
@@ -790,6 +795,8 @@ impl QueryService {
             response_handle,
             message,
             Some(ExtendedDnsError::Blocked),
+            state,
+            validating,
             started,
         )
         .await
@@ -799,6 +806,7 @@ impl QueryService {
         &self,
         request: &Request,
         response_code: ResponseCode,
+        state: &ListenerQueryState,
         started: Instant,
         authentic_data: bool,
     ) {
@@ -808,7 +816,7 @@ impl QueryService {
         }
 
         let elapsed_ms = started.elapsed().as_millis();
-        if self.query_names() {
+        if state.query_names {
             let query = request.queries.queries().first();
             tracing::debug!(
                 listener = %self.listener_name,
@@ -845,37 +853,24 @@ impl RequestHandler for QueryService {
         response_handle: R,
     ) -> ResponseInfo {
         let started = Instant::now();
-        let source = normalize_ip(request.src().ip());
-
-        if !self.acl().is_allowed(source, self.protocol) {
-            self.stats.record_acl_denied();
-            return self
-                .reject(request, response_handle, ResponseCode::Refused, started)
-                .await;
-        }
-
-        if self
-            .rate_limiter()
-            .check_key(&RateKey::from(source))
-            .is_err()
-        {
-            self.stats.record_rate_limited();
-            return self
-                .reject(request, response_handle, ResponseCode::Refused, started)
-                .await;
-        }
-
-        let _permit = match self.inflight().try_acquire_owned() {
+        let state = self.snapshot();
+        let inflight = self.inflight();
+        let _permit = match self.admit_with(request.src().ip(), &state, inflight) {
             Ok(permit) => permit,
             Err(_) => {
-                self.stats.record_overloaded();
                 return self
-                    .reject(request, response_handle, ResponseCode::Refused, started)
+                    .reject(
+                        request,
+                        response_handle,
+                        ResponseCode::Refused,
+                        &state,
+                        started,
+                    )
                     .await;
             }
         };
 
-        self.handle_admitted_request::<R, T>(request, response_handle, started)
+        self.handle_admitted_request::<R, T>(request, response_handle, &state, started)
             .await
     }
 }
@@ -885,8 +880,11 @@ impl QueryService {
         &self,
         request: &Request,
         response_handle: R,
+        state: &ListenerQueryState,
         started: Instant,
     ) -> ResponseInfo {
+        let resolver = self.resolver();
+        let validating = resolver.is_validating();
         if request.queries.len() != 1 {
             return self
                 .send_status(
@@ -894,6 +892,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::FormErr,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -906,6 +905,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::NotImp,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -918,6 +918,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::BADVERS,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -930,6 +931,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::Refused,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -943,6 +945,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::Refused,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -958,18 +961,20 @@ impl QueryService {
                     response_handle,
                     ResponseCode::Refused,
                     None,
+                    state,
                     started,
                 )
                 .await;
         }
 
-        if self.refuse_any() && lower_query.query_type() == RecordType::ANY {
+        if state.refuse_any && lower_query.query_type() == RecordType::ANY {
             return self
                 .send_status(
                     request,
                     response_handle,
                     ResponseCode::Refused,
                     None,
+                    state,
                     started,
                 )
                 .await;
@@ -981,7 +986,7 @@ impl QueryService {
             .is_some_and(|edns| edns.flags().dnssec_ok);
         let query = lower_query.original().clone();
 
-        if let Some(action) = self.blocklist().evaluate(lower_query.name()) {
+        if let Some(action) = state.blocklist.evaluate(lower_query.name()) {
             let extended_error = rpz_extended_dns_error(&action);
             if extended_error.is_some() {
                 self.stats.record_blocked();
@@ -996,6 +1001,7 @@ impl QueryService {
                             response_handle,
                             ResponseCode::NXDomain,
                             extended_error,
+                            state,
                             started,
                         )
                         .await;
@@ -1007,6 +1013,7 @@ impl QueryService {
                             response_handle,
                             ResponseCode::NoError,
                             extended_error,
+                            state,
                             started,
                         )
                         .await;
@@ -1019,6 +1026,7 @@ impl QueryService {
                                 response_handle,
                                 ResponseCode::NoError,
                                 extended_error,
+                                state,
                                 started,
                             )
                             .await;
@@ -1033,6 +1041,7 @@ impl QueryService {
                                 response_handle,
                                 ResponseCode::NoError,
                                 extended_error,
+                                state,
                                 started,
                             )
                             .await;
@@ -1046,6 +1055,8 @@ impl QueryService {
                             &query,
                             target.clone(),
                             ttl,
+                            state,
+                            validating,
                             started,
                             dnssec_ok,
                         )
@@ -1057,9 +1068,10 @@ impl QueryService {
                             request,
                             response_handle,
                             &query,
-                            records.clone(),
+                            records,
+                            state,
+                            validating,
                             started,
-                            dnssec_ok,
                         )
                         .await;
                 }
@@ -1067,8 +1079,8 @@ impl QueryService {
         }
 
         match tokio::time::timeout(
-            self.query_timeout(),
-            self.resolver().resolve_cached(query.clone(), dnssec_ok),
+            state.query_timeout,
+            resolver.resolve_cached(query.clone(), dnssec_ok),
         )
         .await
         {
@@ -1086,22 +1098,30 @@ impl QueryService {
                     response_handle,
                     resolved.message,
                     extended_error,
+                    state,
+                    validating,
                     started,
                 )
                 .await
             }
             Ok(Err(error)) => {
-                self.handle_recursor_error(request, response_handle, error, started)
-                    .await
+                self.handle_recursor_error(
+                    request,
+                    response_handle,
+                    error,
+                    state,
+                    validating,
+                    started,
+                )
+                .await
             }
             Err(_) => {
                 tracing::warn!(
                     listener = %self.listener_name,
-                    timeout_ms = self.query_timeout().as_millis(),
+                    timeout_ms = state.query_timeout.as_millis(),
                     "query timed out"
                 );
-                if let Some(message) = self
-                    .resolver()
+                if let Some(message) = resolver
                     .stale_cached_response(query.clone(), dnssec_ok)
                     .await
                 {
@@ -1112,6 +1132,8 @@ impl QueryService {
                             response_handle,
                             message,
                             Some(ExtendedDnsError::StaleAnswer),
+                            state,
+                            validating,
                             started,
                         )
                         .await;
@@ -1121,6 +1143,7 @@ impl QueryService {
                     response_handle,
                     ResponseCode::ServFail,
                     None,
+                    state,
                     started,
                 )
                 .await
@@ -1133,11 +1156,20 @@ impl QueryService {
         request: &Request,
         response_handle: R,
         error: RecursorError,
+        state: &ListenerQueryState,
+        validating: bool,
         started: Instant,
     ) -> ResponseInfo {
         if let Some(negative) = negative_response(&error) {
             return self
-                .send_negative(request, response_handle, negative, started)
+                .send_negative(
+                    request,
+                    response_handle,
+                    negative,
+                    state,
+                    validating,
+                    started,
+                )
                 .await;
         }
 
@@ -1151,6 +1183,7 @@ impl QueryService {
             response_handle,
             ResponseCode::ServFail,
             None,
+            state,
             started,
         )
         .await
@@ -1253,21 +1286,20 @@ fn records_are_secure(records: &[Record]) -> bool {
 
 fn response_edns(
     request: &Request,
-    max_udp_payload: u16,
+    state: &ListenerQueryState,
     protocol: Protocol,
-    idle_timeout: Duration,
-    client_subnet_v4_prefix: Option<u8>,
-    client_subnet_v6_prefix: Option<u8>,
     extended_error: Option<ExtendedDnsError>,
 ) -> Option<Edns> {
     request.edns.as_ref().map(|request_edns| {
         let mut edns = request_edns.clone();
-        let max_payload = edns.max_payload().max(512).min(max_udp_payload);
+        let max_payload = edns.max_payload().max(512).min(state.max_udp_payload);
         edns.set_max_payload(max_payload);
         edns.set_version(0);
+        edns.options_mut().remove(EdnsCode::Subnet);
 
         if matches!(protocol, Protocol::Tcp | Protocol::Dot) {
-            let timeout = idle_timeout
+            let timeout = state
+                .idle_timeout
                 .as_millis()
                 .div_ceil(KEEPALIVE_TIMEOUT_UNIT_MS)
                 .clamp(1, u16::MAX as u128) as u16;
@@ -1276,22 +1308,6 @@ fn response_edns(
                 EdnsCode::Keepalive.into(),
                 timeout.to_be_bytes().to_vec(),
             ));
-        }
-
-        let source = normalize_ip(request.src().ip());
-        let client_ecs = request_edns.option(EdnsCode::Subnet).cloned();
-        let enabled_prefix = match source {
-            IpAddr::V4(_) => client_subnet_v4_prefix,
-            IpAddr::V6(_) => client_subnet_v6_prefix,
-        };
-
-        if enabled_prefix.is_none() {
-            edns.options_mut().remove(EdnsCode::Subnet);
-        } else if client_ecs.is_none()
-            && let Some(prefix) = enabled_prefix
-        {
-            edns.options_mut()
-                .insert(EdnsOption::Subnet(ClientSubnet::new(source, prefix, 0)));
         }
 
         if let Some(error) = extended_error {
@@ -1304,18 +1320,18 @@ fn response_edns(
     })
 }
 
-fn normalize_ip(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(address)),
-        address => address,
-    }
-}
-
 fn drop_response(request: &Request) -> ResponseInfo {
     let metadata = Metadata::response_from_request(&request.metadata);
+    ResponseInfo::from(Header {
+        metadata,
+        counts: HeaderCounts::default(),
+    })
+}
+
+fn drop_simple(header: &Header) -> ResponseInfo {
+    let mut metadata = header.metadata;
+    metadata.message_type = MessageType::Response;
+    metadata.recursion_available = true;
     ResponseInfo::from(Header {
         metadata,
         counts: HeaderCounts::default(),

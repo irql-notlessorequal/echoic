@@ -18,15 +18,13 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::time::Instant;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, Request as HttpRequest, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use base64::Engine;
@@ -37,14 +35,15 @@ use hickory_server::net::xfer::Protocol as HickoryProtocol;
 use hickory_server::server::Request;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ListenerConfig, Protocol};
 use crate::listeners::ListenerRuntime;
-use crate::query::QueryService;
-use crate::rate_limit::RateKey;
+use crate::net::normalize_ip;
+use crate::query::{AdmissionError, QueryService};
 use crate::tls::TlsState;
 
 #[derive(Clone)]
@@ -68,7 +67,13 @@ pub struct DohState {
 
 #[derive(Clone)]
 struct BufferResponseHandler {
-    bytes: Arc<tokio::sync::Mutex<Option<Vec<u8>>>>,
+    bytes: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+#[derive(Deserialize)]
+struct DohQuery {
+    #[serde(default)]
+    dns: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -88,7 +93,7 @@ impl hickory_server::server::ResponseHandler for BufferResponseHandler {
         let mut encoder = hickory_server::proto::serialize::binary::BinEncoder::new(&mut bytes);
         encoder.set_max_size(u16::MAX);
         let info = response.destructive_emit(&mut encoder)?;
-        *self.bytes.lock().await = Some(bytes);
+        *self.bytes.lock().expect("response buffer lock poisoned") = Some(bytes);
         Ok(info)
     }
 }
@@ -97,8 +102,6 @@ const URL_SAFE_OPTIONAL_PAD: GeneralPurpose = GeneralPurpose::new(
     &alphabet::URL_SAFE,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
-
-const MAX_DOH_BODY_LIMIT: usize = 65535;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn start_doh_listener(
@@ -112,8 +115,6 @@ pub async fn start_doh_listener(
     landing_html: Option<String>,
     landing_css: Option<String>,
     ready: Arc<AtomicBool>,
-    _handshake_timeout: Duration,
-    _query_timeout: Duration,
 ) -> anyhow::Result<ListenerRuntime> {
     let max_connections = listener
         .limits
@@ -172,8 +173,8 @@ pub async fn start_doh_listener(
         .route("/assets/landing.css", get(landing_stylesheet))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .with_state(state)
-        .layer(DefaultBodyLimit::max(MAX_DOH_BODY_LIMIT))
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(state, doh_guard))
         .layer(axum::middleware::from_fn(security_headers));
 
     let token = CancellationToken::new();
@@ -277,9 +278,12 @@ pub async fn start_doh_listener(
                         }
                     });
                 }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::debug!(error = %error, "DoH connection task failed");
+                    }
+                }
             }
-
-            while connections.try_join_next().is_some() {}
         }
 
         while connections.join_next().await.is_some() {}
@@ -302,45 +306,50 @@ pub async fn start_doh_listener(
     })
 }
 
-async fn dns_query(
+async fn doh_guard(
     State(state): State<DohState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
+    request: HttpRequest,
+    next: Next,
 ) -> Response {
-    let runtime = state.runtime.load();
-    let hostname = runtime.hostname.clone();
-    let max_doh_body = runtime.max_doh_body;
-    let max_doh_uri = runtime.max_doh_uri;
-    let concurrency = runtime.concurrency.clone();
-    if let Err(status) = validate_host(&headers, &uri, &hostname) {
+    let runtime = state.runtime.load_full();
+    if let Err(status) = validate_host(request.headers(), request.uri(), &runtime.hostname) {
         return status.into_response();
     }
-
     let source = normalize_ip(peer.ip());
     if !state.service.acl().is_allowed(source, Protocol::Doh) {
         state.service.stats().record_acl_denied();
         return StatusCode::FORBIDDEN.into_response();
     }
-    if state
-        .service
-        .rate_limiter()
-        .check_key(&RateKey::from(source))
-        .is_err()
-    {
-        state.service.stats().record_rate_limited();
-        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-        response
-            .headers_mut()
-            .insert("retry-after", HeaderValue::from_static("1"));
-        return response;
-    }
-    let inflight_permit = match state.service.inflight().try_acquire_owned() {
+    next.run(request).await
+}
+
+async fn dns_query(
+    State(state): State<DohState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<DohQuery>,
+    method: Method,
+    headers: HeaderMap,
+    request: HttpRequest,
+) -> Response {
+    let runtime = state.runtime.load_full();
+    let max_doh_body = runtime.max_doh_body;
+    let max_doh_uri = runtime.max_doh_uri;
+    let concurrency = runtime.concurrency.clone();
+    let query_state = state.service.snapshot();
+    let inflight = state.service.inflight();
+
+    let inflight_permit = match state.service.admit_with(peer.ip(), &query_state, inflight) {
         Ok(permit) => permit,
-        Err(_) => {
-            state.service.stats().record_overloaded();
+        Err(AdmissionError::AclDenied) => return StatusCode::FORBIDDEN.into_response(),
+        Err(AdmissionError::RateLimited) => {
+            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            return response;
+        }
+        Err(AdmissionError::Overloaded) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -354,10 +363,8 @@ async fn dns_query(
 
     let dns_bytes = match method {
         Method::GET => {
-            let query = uri.query().unwrap_or("");
-            let value = match query_param(query, "dns") {
-                Some(value) => value,
-                None => return StatusCode::BAD_REQUEST.into_response(),
+            let Some(value) = params.dns else {
+                return StatusCode::BAD_REQUEST.into_response();
             };
             match decode_dns(&value, max_doh_uri) {
                 Ok(bytes) => bytes,
@@ -368,15 +375,32 @@ async fn dns_query(
             if !valid_content_type(&headers) {
                 return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
             }
-            if body.is_empty() {
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-            if body.len() > max_doh_body {
+            if request
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > max_doh_body)
+            {
                 return StatusCode::PAYLOAD_TOO_LARGE.into_response();
             }
-            body.to_vec()
+            let bytes = match axum::body::to_bytes(request.into_body(), max_doh_body).await {
+                Ok(bytes) => bytes,
+                Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            };
+            if bytes.is_empty() {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            bytes.to_vec()
         }
-        _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        _ => {
+            let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+            response.headers_mut().insert(
+                axum::http::header::ALLOW,
+                HeaderValue::from_static("GET, POST"),
+            );
+            return response;
+        }
     };
 
     let request = match Request::from_bytes(dns_bytes, peer, HickoryProtocol::Tcp) {
@@ -384,32 +408,31 @@ async fn dns_query(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let buffer = Arc::new(tokio::sync::Mutex::new(None));
+    let buffer = Arc::new(std::sync::Mutex::new(None));
     let response_handle = BufferResponseHandler {
         bytes: buffer.clone(),
     };
 
-    let request_result = tokio::time::timeout(
-        state.service.query_timeout(),
-        state
-            .service
-            .handle_admitted_request::<_, hickory_net::runtime::TokioTime>(
-                &request,
-                response_handle,
-                Instant::now(),
-            ),
-    )
-    .await;
+    state
+        .service
+        .handle_admitted_request::<_, hickory_net::runtime::TokioTime>(
+            &request,
+            response_handle,
+            &query_state,
+            Instant::now(),
+        )
+        .await;
 
-    let bytes = match request_result {
-        Ok(_) => buffer.lock().await.take().unwrap_or_default(),
-        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
-    };
+    let bytes = buffer
+        .lock()
+        .expect("response buffer lock poisoned")
+        .take()
+        .unwrap_or_default();
     if bytes.is_empty() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let mut response = Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
         .header(CACHE_CONTROL, "no-store")
         .header(CONTENT_TYPE, "application/dns-message")
@@ -418,15 +441,11 @@ async fn dns_query(
         .unwrap();
 
     let _ = (inflight_permit, doh_permit);
-    add_security_headers(&mut response);
     response
 }
 
-async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
+async fn landing(State(state): State<DohState>) -> Response {
     let runtime = state.runtime.load();
-    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
-        return status.into_response();
-    }
 
     let snapshot = state.service.stats().snapshot();
     let hostname = runtime.hostname.clone();
@@ -476,31 +495,20 @@ async fn landing(State(state): State<DohState>, uri: Uri, headers: HeaderMap) ->
             cache_hit_rate = cache_hit_rate(&snapshot),
         )
     };
-    let mut response = Html(html).into_response();
-    add_security_headers(&mut response);
-    response
+    Html(html).into_response()
 }
 
-async fn landing_stylesheet(
-    State(state): State<DohState>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
+async fn landing_stylesheet(State(state): State<DohState>) -> Response {
     let runtime = state.runtime.load();
-    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
-        return status.into_response();
-    }
     let body = runtime
         .landing_css
         .clone()
         .unwrap_or_else(|| include_str!("../assets/landing.css").to_owned());
-    let mut response = Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/css; charset=utf-8")
         .body(axum::body::Body::from(body))
-        .unwrap();
-    add_security_headers(&mut response);
-    response
+        .unwrap()
 }
 
 fn cache_hit_rate(snapshot: &crate::stats::StatsSnapshot) -> String {
@@ -563,25 +571,16 @@ fn render_landing_template(
     rendered
 }
 
-async fn healthz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    let runtime = state.runtime.load();
-    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
-        return status.into_response();
-    }
+async fn healthz() -> Response {
     let mut response = (StatusCode::OK, "ok\n").into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    add_security_headers(&mut response);
     response
 }
 
-async fn readyz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> Response {
-    let runtime = state.runtime.load();
-    if let Err(status) = validate_host(&headers, &uri, &runtime.hostname) {
-        return status.into_response();
-    }
+async fn readyz(State(state): State<DohState>) -> Response {
     let ready = state.ready.load(Ordering::Relaxed);
     let (status, body) = if ready {
         (StatusCode::OK, "ok\n")
@@ -593,7 +592,6 @@ async fn readyz(State(state): State<DohState>, uri: Uri, headers: HeaderMap) -> 
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    add_security_headers(&mut response);
     response
 }
 
@@ -634,17 +632,25 @@ fn validate_host(headers: &HeaderMap, uri: &Uri, expected: &str) -> Result<(), S
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    if authority.is_some() && host_header.is_some() && authority != host_header {
+    if let (Some(authority), Some(host_header)) = (&authority, &host_header)
+        && normalize_authority(authority) != normalize_authority(host_header)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
 
     let raw = authority.or(host_header).ok_or(StatusCode::BAD_REQUEST)?;
-    let (name, _) = split_host_port(&raw);
-    let name = name.strip_suffix('.').unwrap_or(name);
+    let (name, _) = normalize_authority(&raw);
     if !name.eq_ignore_ascii_case(expected) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
+}
+
+fn normalize_authority(value: &str) -> (String, Option<u16>) {
+    let (name, port) = split_host_port(value);
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let port = port.and_then(|port| port.parse::<u16>().ok());
+    (name, port.filter(|port| *port != 443))
 }
 
 fn split_host_port(value: &str) -> (&str, Option<&str>) {
@@ -672,17 +678,6 @@ fn split_host_port(value: &str) -> (&str, Option<&str>) {
     (value, None)
 }
 
-fn query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        let name = parts.next()?;
-        if name == key {
-            return parts.next().map(str::to_string);
-        }
-    }
-    None
-}
-
 fn decode_dns(value: &str, max: usize) -> Result<Vec<u8>, StatusCode> {
     if value.chars().any(char::is_whitespace) {
         return Err(StatusCode::BAD_REQUEST);
@@ -705,16 +700,6 @@ fn valid_content_type(headers: &HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .map(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
         .unwrap_or(false)
-}
-
-fn normalize_ip(address: std::net::IpAddr) -> std::net::IpAddr {
-    match address {
-        std::net::IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(address)),
-        address => address,
-    }
 }
 
 #[derive(Clone)]
