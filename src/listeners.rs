@@ -17,6 +17,7 @@ pub use crate::doh::start_doh_listener;
 pub use crate::dot::start_dot_listener;
 
 use std::net::SocketAddr;
+use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -30,9 +31,28 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ListenerConfig, Protocol};
+use crate::net::apply_dscp;
 use crate::query::{ListenerQueryState, QueryService};
 
 const TCP_RESPONSE_BUFFER_SIZE: usize = 32;
+
+pub(crate) fn apply_listener_dscp(
+    listener: &ListenerConfig,
+    socket: &impl AsFd,
+    address: SocketAddr,
+) {
+    let Some(dscp) = listener.dscp else {
+        return;
+    };
+    if let Err(error) = apply_dscp(socket, address, dscp) {
+        tracing::warn!(
+            listener = %listener.name,
+            dscp,
+            error = %error,
+            "failed to set listener DSCP; continuing without it"
+        );
+    }
+}
 
 pub struct ListenerRuntime {
     pub name: String,
@@ -45,7 +65,17 @@ pub struct ListenerRuntime {
     pub dot_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
     pub doh_runtime: Option<Arc<ArcSwap<crate::doh::DohRuntimeState>>>,
     pub doh_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
+    pub dscp: Option<u8>,
+    pub configured_dscp: Option<u8>,
     pub task: JoinHandle<Result<(), NetError>>,
+}
+
+impl ListenerRuntime {
+    pub fn observe_dscp(&mut self, new_dscp: Option<u8>) -> bool {
+        let changed = new_dscp != self.dscp && new_dscp != self.configured_dscp;
+        self.configured_dscp = new_dscp;
+        changed
+    }
 }
 
 pub async fn start_listener(
@@ -71,6 +101,7 @@ pub async fn start_listener(
                     listener.name, listener.address
                 )
             })?;
+            apply_listener_dscp(listener, &socket, bound_address);
             server.register_socket(socket);
             bound_address
         }
@@ -87,6 +118,7 @@ pub async fn start_listener(
                     listener.name, listener.address
                 )
             })?;
+            apply_listener_dscp(listener, &socket, bound_address);
             server.register_listener(socket, request_timeout, TCP_RESPONSE_BUFFER_SIZE);
             bound_address
         }
@@ -116,6 +148,8 @@ pub async fn start_listener(
         token,
         query_state,
         tls_state: Arc::new(ArcSwap::from_pointee(None)),
+        dscp: listener.dscp,
+        configured_dscp: listener.dscp,
         dot_max_connections: None,
         doh_runtime: None,
         doh_max_connections: None,

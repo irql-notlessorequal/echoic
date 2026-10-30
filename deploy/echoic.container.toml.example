@@ -16,6 +16,7 @@ protocol = "udp"
 address = "0.0.0.0:53"
 limits = { qps = 100, burst = 200 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "public-tcp"
@@ -23,6 +24,7 @@ protocol = "tcp"
 address = "0.0.0.0:53"
 limits = { qps = 100, burst = 200, max_connections = 512 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "public-dot"
@@ -31,6 +33,7 @@ address = "0.0.0.0:853"
 tls = "public"
 limits = { qps = 50, burst = 100, max_connections = 512 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "public-doh"
@@ -50,6 +53,7 @@ ns_recursion_limit = 24
 qname_minimization = "relaxed"
 case_randomization = true
 edns_payload_len = 1232
+dscp = 45
 
 [dnssec]
 enabled = true

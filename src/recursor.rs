@@ -14,16 +14,21 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::fs;
-use std::net::IpAddr;
+use std::future::Future;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use hickory_server::net::runtime::TokioRuntimeProvider;
+use hickory_server::net::runtime::iocompat::AsyncIoTokioAsStd;
+use hickory_server::net::runtime::{RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime};
 use hickory_server::net::{DnsError, NetError};
 use hickory_server::proto::dnssec::TrustAnchors;
 use hickory_server::proto::op::{Message, Query};
@@ -34,11 +39,14 @@ use hickory_server::resolver::recursor::{
     DnssecConfig as HickoryDnssecConfig, DnssecPolicy, QNameMinimization, Recursor, RecursorError,
     RecursorOptions,
 };
+use tokio::net::{TcpSocket, TcpStream};
 
 use crate::config::{Config, QNameMinimization as ConfigQNameMinimization};
+use crate::net::apply_dscp;
 
 const EMBEDDED_ROOT_HINTS: &str = include_str!("../assets/root.hints");
 const EMBEDDED_ROOT_HINTS_NAME: &str = "assets/root.hints";
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct ResolvedResponse {
@@ -222,8 +230,107 @@ fn is_negative_recursor_error(error: &RecursorError) -> bool {
     )
 }
 
+#[derive(Clone)]
+struct DscpRuntimeProvider {
+    inner: TokioRuntimeProvider,
+    dscp: u8,
+    warned: Arc<AtomicBool>,
+}
+
+impl DscpRuntimeProvider {
+    fn new(dscp: u8) -> Self {
+        Self {
+            inner: TokioRuntimeProvider::new(),
+            dscp,
+            warned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl RuntimeProvider for DscpRuntimeProvider {
+    type Handle = TokioHandle;
+    type Timer = TokioTime;
+    type Udp = tokio::net::UdpSocket;
+    type Tcp = AsyncIoTokioAsStd<TcpStream>;
+
+    fn create_handle(&self) -> Self::Handle {
+        self.inner.create_handle()
+    }
+
+    fn connect_tcp(
+        &self,
+        server_addr: SocketAddr,
+        bind_addr: Option<SocketAddr>,
+        wait_for: Option<Duration>,
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
+        let dscp = self.dscp;
+        let warned = self.warned.clone();
+        Box::pin(async move {
+            let socket = match server_addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4(),
+                SocketAddr::V6(_) => TcpSocket::new_v6(),
+            }?;
+
+            if let Some(bind_addr) = bind_addr {
+                socket.bind(bind_addr)?;
+            }
+
+            socket.set_nodelay(true)?;
+            if let Err(error) = apply_dscp(&socket, server_addr, dscp)
+                && !warned.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    dscp,
+                    transport = "tcp",
+                    error = %error,
+                    "failed to set upstream DSCP; continuing without it"
+                );
+            }
+
+            let wait_for = wait_for.unwrap_or(UPSTREAM_CONNECT_TIMEOUT);
+            match tokio::time::timeout(wait_for, socket.connect(server_addr)).await {
+                Ok(Ok(socket)) => Ok(AsyncIoTokioAsStd(socket)),
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    tracing::debug!(%server_addr, "TCP connect timeout");
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TCP connect timed out",
+                    ))
+                }
+            }
+        })
+    }
+
+    fn bind_udp(
+        &self,
+        local_addr: SocketAddr,
+        _server_addr: SocketAddr,
+    ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
+        let dscp = self.dscp;
+        let warned = self.warned.clone();
+        Box::pin(async move {
+            let socket = tokio::net::UdpSocket::bind(local_addr).await?;
+            if let Err(error) = apply_dscp(&socket, local_addr, dscp)
+                && !warned.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    dscp,
+                    transport = "udp",
+                    error = %error,
+                    "failed to set upstream DSCP; continuing without it"
+                );
+            }
+            Ok(socket)
+        })
+    }
+}
+
 pub fn build_recursor(config: &Config) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
-    build_recursor_with_provider(config, TokioRuntimeProvider::new())
+    match config.recursor.dscp {
+        Some(dscp) => build_recursor_with_provider(config, DscpRuntimeProvider::new(dscp)),
+        None => build_recursor_with_provider(config, TokioRuntimeProvider::new()),
+    }
 }
 
 pub fn build_recursor_with_provider<P: ConnectionProvider>(
@@ -325,5 +432,50 @@ mod tests {
 
         assert!(!addresses.is_empty());
         assert!(addresses.iter().any(|address| address.is_ipv4()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dscp_provider_applies_udp_socket_class() {
+        let provider = DscpRuntimeProvider::new(45);
+        let udp = provider
+            .bind_udp(
+                "127.0.0.1:0".parse().unwrap(),
+                "192.0.2.1:53".parse().unwrap(),
+            )
+            .await
+            .expect("bind udp");
+        assert_eq!(
+            socket2::SockRef::from(&udp).tos_v4().expect("read tos"),
+            180
+        );
+        drop(udp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dscp_provider_applies_tcp_socket_class_before_connect() {
+        use std::time::Duration;
+        let listener: tokio::net::TcpListener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr: std::net::SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let provider = DscpRuntimeProvider::new(45);
+        let result = provider
+            .connect_tcp(addr, None, Some(Duration::from_secs(2)))
+            .await;
+        assert!(result.is_ok(), "connect failed");
+        let stream = result.unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&stream.0)
+                .tos_v4()
+                .expect("read tos"),
+            180
+        );
+        server.await.unwrap();
     }
 }

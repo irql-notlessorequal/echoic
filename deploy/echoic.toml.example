@@ -17,6 +17,7 @@ address = "192.168.1.10:53"
 acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
 limits = { qps = 100, burst = 200 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "lan-tcp"
@@ -25,6 +26,7 @@ address = "192.168.1.10:53"
 acl = { allow = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] }
 limits = { qps = 100, burst = 200, max_connections = 512 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "public-dot"
@@ -34,6 +36,7 @@ tls = "public"
 require_dot_alpn = false
 limits = { qps = 50, burst = 100, max_connections = 512 }
 edns_padding_block_size = 128
+dscp = 45
 
 [[listeners]]
 name = "public-doh"
@@ -60,6 +63,7 @@ ns_recursion_limit = 24
 qname_minimization = "relaxed"
 case_randomization = true
 edns_payload_len = 1232
+dscp = 45
 
 [dnssec]
 enabled = true

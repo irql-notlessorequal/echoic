@@ -14,6 +14,7 @@ Supporting features like...
 - Persistent file caching
 - Case randomization for responses
 - QNAME minimization
+- Per-listener and upstream DSCP marking
 - RPZ-based blocklists
 - A customizable landing page for DoH
 

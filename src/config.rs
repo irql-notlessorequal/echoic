@@ -25,7 +25,7 @@ use serde::Deserialize;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::error::ConfigError;
-use crate::net::normalize_ip;
+use crate::net::{MAX_DSCP, normalize_ip};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/echoic/echoic.toml";
 
@@ -203,6 +203,14 @@ impl Config {
                     listener.name
                 ));
             }
+            if let Some(dscp) = listener.dscp
+                && dscp > MAX_DSCP
+            {
+                errors.push(format!(
+                    "listener {:?}: dscp must be between 0 and {MAX_DSCP}",
+                    listener.name
+                ));
+            }
             if listener.name.is_empty() {
                 errors.push("listener name must not be empty".to_owned());
             }
@@ -359,6 +367,11 @@ impl Config {
             && path.as_os_str().is_empty()
         {
             errors.push("recursor.root_hints must not be empty".to_owned());
+        }
+        if let Some(dscp) = self.recursor.dscp
+            && dscp > MAX_DSCP
+        {
+            errors.push(format!("recursor.dscp must be between 0 and {MAX_DSCP}"));
         }
     }
 
@@ -749,6 +762,8 @@ pub struct ListenerConfig {
     pub require_dot_alpn: bool,
     #[serde(default)]
     pub tcp_notsent_lowat: Option<u32>,
+    #[serde(default)]
+    pub dscp: Option<u8>,
 }
 
 impl ListenerConfig {
@@ -786,6 +801,8 @@ pub struct RecursorConfig {
     pub case_randomization: bool,
     #[serde(default = "default_edns_payload_len")]
     pub edns_payload_len: u16,
+    #[serde(default)]
+    pub dscp: Option<u8>,
 }
 
 impl Default for RecursorConfig {
@@ -802,6 +819,7 @@ impl Default for RecursorConfig {
             qname_minimization: QNameMinimization::Relaxed,
             case_randomization: true,
             edns_payload_len: DEFAULT_EDNS_PAYLOAD_LEN,
+            dscp: None,
         }
     }
 }
@@ -1481,6 +1499,63 @@ tcp_notsent_lowat = 16384
             validation_message(config)
                 .contains("tcp_notsent_lowat is only valid for doh listeners")
         );
+    }
+
+    #[test]
+    fn listener_dscp_is_optional_and_numeric() {
+        let config = Config::from_toml_str(MINIMAL_CONFIG).expect("minimal config");
+        assert_eq!(config.listeners[0].dscp, None);
+
+        for dscp in [0, 45, 63] {
+            let config_str = format!(
+                r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+dscp = {dscp}
+"#
+            );
+            let config = Config::from_toml_str(&config_str).expect("listener dscp");
+            assert_eq!(config.listeners[0].dscp, Some(dscp));
+        }
+
+        let config = r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+dscp = "nqb"
+"#;
+        assert!(matches!(
+            Config::from_toml_str(config),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_listener_dscp_above_maximum() {
+        let config = r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+dscp = 64
+"#;
+        assert!(validation_message(config).contains("dscp must be between 0 and 63"));
+    }
+
+    #[test]
+    fn recursor_dscp_is_optional_and_validated() {
+        let config = Config::from_toml_str(MINIMAL_CONFIG).expect("minimal config");
+        assert_eq!(config.recursor.dscp, None);
+
+        let config = format!("[recursor]\ndscp = 45\n{MINIMAL_CONFIG}");
+        let config = Config::from_toml_str(&config).expect("recursor dscp");
+        assert_eq!(config.recursor.dscp, Some(45));
+
+        let config = format!("[recursor]\ndscp = 64\n{MINIMAL_CONFIG}");
+        assert!(validation_message(&config).contains("recursor.dscp must be between 0 and 63"));
     }
 
     #[test]

@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{ListenerConfig, Protocol};
 use crate::listeners::ListenerRuntime;
+use crate::net::apply_dscp;
 use crate::query::QueryService;
 use crate::tls::TlsState;
 
@@ -71,6 +72,7 @@ pub async fn start_dot_listener(
             listener.name, listener.address
         )
     })?;
+    crate::listeners::apply_listener_dscp(listener, &socket, bound_address);
 
     tracing::info!(
         listener = %listener.name,
@@ -85,9 +87,11 @@ pub async fn start_dot_listener(
     let tls_state_for_task = tls_state_swap.clone();
     let max_connections_for_task = max_connections_state.clone();
     let listener_name = listener.name.clone();
+    let listener_dscp = listener.dscp;
 
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
+        let mut connection_dscp_enabled = true;
         loop {
             tokio::select! {
                 _ = task_token.cancelled() => break,
@@ -110,6 +114,20 @@ pub async fn start_dot_listener(
                             continue;
                         }
                     };
+
+                    if connection_dscp_enabled
+                        && let Some(dscp) = listener_dscp
+                        && let Err(error) = apply_dscp(&tcp_stream, src_addr, dscp)
+                    {
+                        connection_dscp_enabled = false;
+                        tracing::warn!(
+                            listener = %listener_name,
+                            src = %src_addr,
+                            dscp,
+                            error = %error,
+                            "failed to set DoT connection DSCP; disabling it for this listener"
+                        );
+                    }
 
                     let service = service_for_task.clone();
                     let tls_state = tls_state_for_task.load();
@@ -141,6 +159,8 @@ pub async fn start_dot_listener(
         token,
         query_state,
         tls_state: tls_state_swap,
+        dscp: listener.dscp,
+        configured_dscp: listener.dscp,
         dot_max_connections: Some(max_connections_state),
         doh_max_connections: None,
         doh_runtime: None,

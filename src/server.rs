@@ -69,6 +69,7 @@ struct ListenerUpdate {
     dot_max_connections: Option<Arc<ArcSwap<Arc<Semaphore>>>>,
     doh_runtime: Option<Arc<ArcSwap<DohRuntimeState>>>,
     doh_max_connections: Option<Arc<ArcSwap<Arc<Semaphore>>>>,
+    dscp: Option<u8>,
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
@@ -486,7 +487,7 @@ async fn reload_once(
     let new_paths = watched_paths(&new_config, config_path);
     let (new_watcher, new_watched) = build_watcher(&new_paths, tx)?;
 
-    let (updates, listener_changes) = {
+    let (updates, mut listener_changes) = {
         let old_runtimes = ctx.runtimes.lock().unwrap();
         let mut listener_changes = false;
         let mut updates = Vec::new();
@@ -617,6 +618,7 @@ async fn reload_once(
                 dot_max_connections,
                 doh_runtime,
                 doh_max_connections,
+                dscp: new_listener.dscp,
             });
         }
 
@@ -686,6 +688,10 @@ async fn reload_once(
         }) {
             runtime.query_state.store(update.query_state.clone());
             runtime.tls_state.store(Arc::new(update.tls_state.clone()));
+            if runtime.observe_dscp(update.dscp) {
+                tracing::warn!(listener = %update.name, "listener dscp changed; restart required");
+                listener_changes = true;
+            }
             if let Some(max_connections) = &update.dot_max_connections
                 && let Some(existing) = &runtime.dot_max_connections
             {
