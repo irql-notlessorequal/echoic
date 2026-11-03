@@ -63,6 +63,7 @@ impl RpzPolicy {
             .map(Name::from_str)
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid RPZ origin: {error}"))?;
+        let parser_origin = configured_origin.clone().unwrap_or_else(Name::root);
 
         let nodata_target = Name::from_str("*.").expect("valid RPZ NODATA target");
         let passthru_target = Name::from_str("rpz-passthru.").expect("valid RPZ passthru target");
@@ -75,7 +76,7 @@ impl RpzPolicy {
             let (parsed_origin, records) = Parser::new(
                 contents,
                 Some(path.to_path_buf()),
-                configured_origin.clone(),
+                Some(parser_origin.clone()),
             )
             .parse()
             .map_err(|error| anyhow::anyhow!("failed to parse RPZ {}: {error}", path.display()))?;
@@ -239,6 +240,34 @@ $ORIGIN rpz.local.
         let policy = RpzPolicy::load(&paths, None).unwrap();
         let name = Name::from_ascii("example.net.").unwrap();
         assert!(matches!(policy.evaluate(&name), Some(RpzAction::Drop)));
+    }
+
+    #[test]
+    fn missing_origin_defaults_to_root() {
+        let (_dir, paths) = write_policy(
+            r#"
+$TTL 2w
+@ IN SOA localhost. root.localhost. (
+       2   ; serial
+       2w  ; refresh
+       2w  ; retry
+       2w  ; expiry
+       2w) ; minimum
+@ IN NS localhost.
+blocked.example.com CNAME .
+*.ads.example.com CNAME .
+"#,
+        );
+
+        let policy = RpzPolicy::load(&paths, None).unwrap();
+        assert!(matches!(
+            policy.evaluate(&Name::from_ascii("blocked.example.com.").unwrap()),
+            Some(RpzAction::Nxdomain)
+        ));
+        assert!(matches!(
+            policy.evaluate(&Name::from_ascii("a.ads.example.com.").unwrap()),
+            Some(RpzAction::Nxdomain)
+        ));
     }
 
     #[test]

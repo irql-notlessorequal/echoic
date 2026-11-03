@@ -746,6 +746,7 @@ pub fn build_filter(logging: &crate::config::LoggingConfig) -> anyhow::Result<En
         }
         let resolver_level = if logging.query_names { "info" } else { "error" };
         directives.push(format!("hickory_resolver={resolver_level}"));
+        directives.push("rustls::msgs::handshake=error".to_owned());
     }
 
     EnvFilter::try_new(directives.join(","))
@@ -1133,6 +1134,10 @@ address = "127.0.0.1:0"
         let rendered = filter.to_string();
         assert!(rendered.contains("hickory_resolver=error"), "{rendered}");
         assert!(rendered.contains("hickory_server=warn"), "{rendered}");
+        assert!(
+            rendered.contains("rustls::msgs::handshake=error"),
+            "{rendered}"
+        );
 
         logging.query_names = true;
         let filter = build_filter(&logging).expect("filter");
