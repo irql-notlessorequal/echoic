@@ -17,7 +17,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use std::time::Instant;
 
 use axum::Router;
@@ -45,6 +46,9 @@ use crate::listeners::ListenerRuntime;
 use crate::net::{apply_dscp, normalize_ip};
 use crate::query::{AdmissionError, QueryService};
 use crate::tls::TlsState;
+
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const DNS_MEDIA_TYPE: &str = "application/dns-message";
 
 #[derive(Clone)]
 pub struct DohRuntimeState {
@@ -120,7 +124,7 @@ pub async fn start_doh_listener(
         .limits
         .effective(listener.protocol)
         .max_connections
-        .unwrap_or(512) as usize;
+        .expect("stream connection limit") as usize;
 
     let query_state = service.state();
     let service = Arc::new(service);
@@ -174,6 +178,7 @@ pub async fn start_doh_listener(
         .route("/assets/landing.css", get(landing_stylesheet))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(state, doh_guard))
         .layer(axum::middleware::from_fn(security_headers));
@@ -204,6 +209,7 @@ pub async fn start_doh_listener(
                         Ok(result) => result,
                         Err(error) => {
                             tracing::debug!(listener = %listener_name, error = %error, "error accepting DoH connection");
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                             continue;
                         }
                     };
@@ -236,6 +242,7 @@ pub async fn start_doh_listener(
                     let tls_state = tls_state.as_ref().clone().expect("tls state");
                     let service = service_for_task.clone();
                     let handshake_timeout = service.query_timeout();
+                    let idle_state = service.state();
                     let token = task_token.clone();
                     let app = app_for_task.clone();
                     let doh_runtime = doh_runtime_for_task.load();
@@ -258,7 +265,11 @@ pub async fn start_doh_listener(
                     }
                     connections.spawn(async move {
                         let _permit = permit;
-                        let tls_stream = match tokio::time::timeout(handshake_timeout, tls_state.acceptor().accept(tcp_stream)).await {
+                        let handshake = tokio::time::timeout(handshake_timeout, tls_state.acceptor().accept(tcp_stream));
+                        let tls_stream = match tokio::select! {
+                            _ = token.cancelled() => return,
+                            result = handshake => result,
+                        } {
                             Ok(Ok(stream)) => stream,
                             Ok(Err(error)) => {
                                 tracing::debug!(src = %src_addr, error = %error, "DoH TLS handshake failed");
@@ -273,24 +284,38 @@ pub async fn start_doh_listener(
                         let io = hyper_util::rt::TokioIo::new(tls_stream);
                         let peer = src_addr;
                         let base_service = app.clone().into_service::<hyper::body::Incoming>();
+                        let activity = Arc::new(tokio::sync::Notify::new());
+                        let active = Arc::new(AtomicUsize::new(0));
                         let tower_service = PeerTowerService {
                             inner: base_service,
                             peer,
+                            activity: activity.clone(),
+                            active: active.clone(),
                         };
                         let service = hyper_util::service::TowerToHyperService::new(tower_service);
                         let mut builder = AutoBuilder::new(TokioExecutor::new());
                         builder.http2().max_concurrent_streams(max_streams);
                         let conn = builder.serve_connection(io, service);
                         tokio::pin!(conn);
-                        tokio::select! {
-                            result = &mut conn => {
-                                if let Err(error) = result {
-                                    tracing::debug!(src = %src_addr, error = %error, "DoH connection error");
+                        loop {
+                            tokio::select! {
+                                result = &mut conn => {
+                                    if let Err(error) = result {
+                                        tracing::debug!(src = %src_addr, error = %error, "DoH connection error");
+                                    }
+                                    break;
                                 }
-                            }
-                            _ = token.cancelled() => {
-                                conn.as_mut().graceful_shutdown();
-                                let _ = (&mut conn).await;
+                                _ = token.cancelled() => {
+                                    conn.as_mut().graceful_shutdown();
+                                    let _ = (&mut conn).await;
+                                    break;
+                                }
+                                _ = activity.notified() => {}
+                                _ = tokio::time::sleep(idle_state.load().idle_timeout) => {
+                                    if active.load(Ordering::Relaxed) == 0 {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     });
@@ -332,6 +357,13 @@ async fn doh_guard(
     next: Next,
 ) -> Response {
     let runtime = state.runtime.load_full();
+    if request
+        .uri()
+        .path_and_query()
+        .is_some_and(|uri| uri.as_str().len() > runtime.max_doh_uri)
+    {
+        return StatusCode::URI_TOO_LONG.into_response();
+    }
     if let Err(status) = validate_host(request.headers(), request.uri(), &runtime.hostname) {
         return status.into_response();
     }
@@ -353,7 +385,6 @@ async fn dns_query(
 ) -> Response {
     let runtime = state.runtime.load_full();
     let max_doh_body = runtime.max_doh_body;
-    let max_doh_uri = runtime.max_doh_uri;
     let concurrency = runtime.concurrency.clone();
     let query_state = state.service.snapshot();
     let inflight = state.service.inflight();
@@ -385,7 +416,7 @@ async fn dns_query(
             let Some(value) = params.dns else {
                 return StatusCode::BAD_REQUEST.into_response();
             };
-            match decode_dns(&value, max_doh_uri) {
+            match decode_dns(&value, max_doh_body) {
                 Ok(bytes) => bytes,
                 Err(status) => return status.into_response(),
             }
@@ -403,9 +434,15 @@ async fn dns_query(
             {
                 return StatusCode::PAYLOAD_TOO_LARGE.into_response();
             }
-            let bytes = match axum::body::to_bytes(request.into_body(), max_doh_body).await {
-                Ok(bytes) => bytes,
-                Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            let bytes = match tokio::time::timeout(
+                query_state.query_timeout,
+                axum::body::to_bytes(request.into_body(), max_doh_body),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
             };
             if bytes.is_empty() {
                 return StatusCode::BAD_REQUEST.into_response();
@@ -454,7 +491,7 @@ async fn dns_query(
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(CACHE_CONTROL, "no-store")
-        .header(CONTENT_TYPE, "application/dns-message")
+        .header(CONTENT_TYPE, DNS_MEDIA_TYPE)
         .header("x-content-type-options", "nosniff")
         .body(axum::body::Body::from(bytes))
         .unwrap();
@@ -590,6 +627,20 @@ fn render_landing_template(
     rendered
 }
 
+async fn metrics(State(state): State<DohState>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(
+            state
+                .service
+                .stats()
+                .prometheus(state.service.inflight().available_permits()),
+        ))
+        .unwrap()
+}
+
 async fn healthz() -> Response {
     let mut response = (StatusCode::OK, "ok\n").into_response();
     response.headers_mut().insert(
@@ -717,7 +768,7 @@ fn valid_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().eq_ignore_ascii_case("application/dns-message"))
+        .map(|value| value.trim().eq_ignore_ascii_case(DNS_MEDIA_TYPE))
         .unwrap_or(false)
 }
 
@@ -725,15 +776,20 @@ fn valid_content_type(headers: &HeaderMap) -> bool {
 struct PeerTowerService<S> {
     inner: S,
     peer: SocketAddr,
+    activity: Arc<tokio::sync::Notify>,
+    active: Arc<AtomicUsize>,
 }
 
 impl<S> tower::Service<hyper::Request<hyper::body::Incoming>> for PeerTowerService<S>
 where
     S: tower::Service<hyper::Request<hyper::body::Incoming>> + Clone,
+    S::Future: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
 
     fn poll_ready(
         &mut self,
@@ -746,7 +802,29 @@ where
         request
             .extensions_mut()
             .insert(axum::extract::ConnectInfo(self.peer));
-        self.inner.call(request)
+        let guard = HttpActivity {
+            active: self.active.clone(),
+            activity: self.activity.clone(),
+        };
+        guard.active.fetch_add(1, Ordering::Relaxed);
+        guard.activity.notify_one();
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let _guard = guard;
+            future.await
+        })
+    }
+}
+
+struct HttpActivity {
+    active: Arc<AtomicUsize>,
+    activity: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for HttpActivity {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        self.activity.notify_one();
     }
 }
 

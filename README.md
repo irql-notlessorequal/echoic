@@ -17,6 +17,7 @@ Supporting features like...
 - Per-listener and upstream DSCP marking
 - RPZ-based blocklists
 - A customizable landing page for DoH
+- Prometheus metrics (and Generic Metrics API)
 
 ## Should I use this?
 
@@ -38,6 +39,7 @@ cargo build
 ```sh
 cargo run -- --check-config --config deploy/echoic.toml.example
 cargo run -- --check-config --config deploy/echoic.container.toml.example
+cargo run -- --check-config --check-files --config /etc/echoic/echoic.toml
 ```
 
 ## License

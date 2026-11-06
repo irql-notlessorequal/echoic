@@ -30,6 +30,9 @@ pub struct Stats {
     blocked: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    latency_count: AtomicU64,
+    latency_nanos: AtomicU64,
+    upstream_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,6 +87,50 @@ impl Stats {
 
     pub fn record_cache_miss(&self, value: u64) {
         self.cache_misses.fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub fn record_latency(&self, elapsed: std::time::Duration) {
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        self.latency_nanos.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn record_upstream_failure(&self) {
+        self.upstream_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn prometheus(&self, available_permits: usize) -> String {
+        use std::fmt::Write;
+        let snapshot = self.snapshot();
+        let mut output = String::new();
+        for (name, value) in [
+            ("echoic_requests_total", snapshot.total),
+            ("echoic_udp_requests_total", snapshot.udp),
+            ("echoic_tcp_requests_total", snapshot.tcp),
+            ("echoic_dot_requests_total", snapshot.dot),
+            ("echoic_doh_requests_total", snapshot.doh),
+            ("echoic_acl_denied_total", snapshot.acl_denied),
+            ("echoic_rate_limited_total", snapshot.rate_limited),
+            ("echoic_overloaded_total", snapshot.overloaded),
+            ("echoic_servfail_total", snapshot.servfail),
+            ("echoic_blocked_total", snapshot.blocked),
+            ("echoic_cache_hits_total", snapshot.cache_hits),
+            ("echoic_cache_misses_total", snapshot.cache_misses),
+            (
+                "echoic_upstream_failures_total",
+                self.upstream_failures.load(Ordering::Relaxed),
+            ),
+        ] {
+            writeln!(output, "# TYPE {name} counter\n{name} {value}").unwrap();
+        }
+        writeln!(output, "# TYPE echoic_query_duration_seconds summary\nechoic_query_duration_seconds_count {}\nechoic_query_duration_seconds_sum {}",
+            self.latency_count.load(Ordering::Relaxed),
+            self.latency_nanos.load(Ordering::Relaxed) as f64 / std::time::Duration::from_secs(1).as_nanos() as f64,
+        ).unwrap();
+        writeln!(output, "# TYPE echoic_query_permits_available gauge\nechoic_query_permits_available {available_permits}").unwrap();
+        output
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,13 +28,16 @@ use hickory_server::proto::rr::Name;
 use hickory_server::proto::rr::{DNSClass, RecordType};
 use moka::Expiry;
 use moka::sync::Cache;
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::config::CacheConfig;
 
 const MAGIC: &[u8; 8] = b"ECHCACHE";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const PAYLOAD_LENGTH_OFFSET: u64 = (MAGIC.len() + size_of::<u32>()) as u64;
+const HEADER_LENGTH: usize = MAGIC.len() + size_of::<u32>() + size_of::<u64>();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
@@ -66,6 +69,7 @@ struct PersistedEntry {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedCache {
+    policy: String,
     entries: Vec<PersistedEntry>,
 }
 
@@ -119,9 +123,42 @@ pub struct PersistentDnsCache {
     memory: Cache<CacheKey, CacheEntry>,
     config: CacheConfig,
     path: Option<PathBuf>,
+    policy: String,
     generation: AtomicU64,
     flushed: AtomicU64,
     io_lock: Mutex<()>,
+}
+
+struct CacheSnapshot<'a>(&'a PersistentDnsCache);
+
+impl Serialize for CacheSnapshot<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("PersistedCache", 2)?;
+        state.serialize_field("policy", &self.0.policy)?;
+        state.serialize_field("entries", &CacheEntries(self.0))?;
+        state.end()
+    }
+}
+
+struct CacheEntries<'a>(&'a PersistentDnsCache);
+
+impl Serialize for CacheEntries<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut entries = serializer.serialize_seq(None)?;
+        for (key, entry) in self.0.memory.iter() {
+            entries.serialize_element(&PersistedEntry {
+                key: key.as_ref().clone(),
+                response: entry.response,
+                original_unix: unix_seconds(entry.original_time),
+                original_nanos: unix_nanos(entry.original_time),
+                valid_unix: unix_seconds(entry.valid_until),
+                valid_nanos: unix_nanos(entry.valid_until),
+                stale_unix: unix_seconds(entry.stale_until),
+                stale_nanos: unix_nanos(entry.stale_until),
+            })?;
+        }
+        entries.end()
+    }
 }
 
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -134,6 +171,23 @@ impl PersistentDnsCache {
             .expect("persistent cache load task failed")
     }
 
+    pub async fn open_for_policy(config: &CacheConfig, policy: String, load: bool) -> Self {
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut unloaded = config.clone();
+            unloaded.persistent = false;
+            let mut cache = Self::new(&unloaded);
+            cache.config = config;
+            cache.policy = policy;
+            if load && cache.config.persistent {
+                cache.load();
+            }
+            cache
+        })
+        .await
+        .expect("persistent cache load task failed")
+    }
+
     pub fn new(config: &CacheConfig) -> Self {
         let memory = Cache::builder()
             .max_capacity(config.max_entries)
@@ -144,6 +198,7 @@ impl PersistentDnsCache {
             memory,
             config: config.clone(),
             path: config.path.clone(),
+            policy: String::new(),
             generation: AtomicU64::new(0),
             flushed: AtomicU64::new(0),
             io_lock: Mutex::new(()),
@@ -159,15 +214,27 @@ impl PersistentDnsCache {
     pub fn get(&self, key: &CacheKey, now: SystemTime) -> Option<(Message, bool)> {
         let entry = self.memory.get(key)?;
 
-        if now <= entry.valid_until {
+        if now < entry.valid_until {
             let elapsed = now
                 .duration_since(entry.original_time)
                 .unwrap_or(Duration::ZERO);
-            return Some((decrement_message(&entry.response, elapsed), false));
+            return Some((decrement_message(entry.response, elapsed), false));
         }
 
         if self.config.serve_stale && now <= entry.stale_until {
-            return Some((zero_ttl_message(&entry.response), true));
+            let mut message = zero_ttl_message(entry.response);
+            message.metadata.authentic_data = false;
+            for record in message
+                .answers
+                .iter_mut()
+                .chain(&mut message.authorities)
+                .chain(&mut message.additionals)
+            {
+                if record.proof.is_secure() {
+                    record.proof = hickory_server::proto::dnssec::Proof::Indeterminate;
+                }
+            }
+            return Some((message, true));
         }
 
         self.memory.invalidate(key);
@@ -176,7 +243,10 @@ impl PersistentDnsCache {
 
     pub fn insert(&self, key: CacheKey, message: Message, now: SystemTime) {
         let ttl = response_ttl(&message, self.config.max_ttl);
-        let valid_for = ttl.min(self.config.max_ttl).max(Duration::from_secs(1));
+        let valid_for = ttl.min(self.config.max_ttl);
+        if valid_for.is_zero() {
+            return;
+        }
         let stale_for = if self.config.serve_stale {
             self.config.stale_ttl
         } else {
@@ -239,30 +309,6 @@ impl PersistentDnsCache {
             return Ok(());
         };
 
-        let mut entries = Vec::new();
-        for (key, entry) in self.memory.iter() {
-            entries.push(PersistedEntry {
-                key: key.as_ref().clone(),
-                response: entry.response.clone(),
-                original_unix: unix_seconds(entry.original_time),
-                original_nanos: unix_nanos(entry.original_time),
-                valid_unix: unix_seconds(entry.valid_until),
-                valid_nanos: unix_nanos(entry.valid_until),
-                stale_unix: unix_seconds(entry.stale_until),
-                stale_nanos: unix_nanos(entry.stale_until),
-            });
-        }
-
-        let payload = serde_json::to_vec(&PersistedCache { entries }).map_err(|error| {
-            io::Error::other(format!("failed to serialize persistent cache: {error}"))
-        })?;
-
-        let mut bytes = Vec::with_capacity(MAGIC.len() + 4 + 8 + payload.len());
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&payload);
-
         let temp_path = unique_sibling(path, "tmp");
         let result = (|| {
             let mut file = OpenOptions::new()
@@ -270,7 +316,16 @@ impl PersistentDnsCache {
                 .create_new(true)
                 .mode(0o600)
                 .open(&temp_path)?;
-            file.write_all(&bytes)?;
+            file.write_all(MAGIC)?;
+            file.write_all(&FORMAT_VERSION.to_le_bytes())?;
+            file.write_all(&0u64.to_le_bytes())?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &CacheSnapshot(self)).map_err(io::Error::other)?;
+            writer.flush()?;
+            let mut file = writer.into_inner().map_err(io::Error::other)?;
+            let payload_len = file.stream_position()? - HEADER_LENGTH as u64;
+            file.seek(SeekFrom::Start(PAYLOAD_LENGTH_OFFSET))?;
+            file.write_all(&payload_len.to_le_bytes())?;
             file.sync_all()?;
             fs::rename(&temp_path, path)
         })();
@@ -306,7 +361,7 @@ impl PersistentDnsCache {
             Err(_) => return,
         };
 
-        if bytes.len() < MAGIC.len() + 4 + 8 {
+        if bytes.len() < HEADER_LENGTH {
             warn!("persistent cache file is too short");
             quarantine_corrupt(path);
             return;
@@ -317,23 +372,34 @@ impl PersistentDnsCache {
             return;
         }
 
-        let version = u32::from_le_bytes(bytes[MAGIC.len()..MAGIC.len() + 4].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            bytes[MAGIC.len()..PAYLOAD_LENGTH_OFFSET as usize]
+                .try_into()
+                .unwrap(),
+        );
         if version != FORMAT_VERSION {
             warn!(version, "unsupported persistent cache format version");
             quarantine_corrupt(path);
             return;
         }
 
-        let payload_len =
-            u64::from_le_bytes(bytes[MAGIC.len() + 4..MAGIC.len() + 12].try_into().unwrap())
-                as usize;
-        if bytes.len() != MAGIC.len() + 12 + payload_len {
+        let payload_len = u64::from_le_bytes(
+            bytes[PAYLOAD_LENGTH_OFFSET as usize..HEADER_LENGTH]
+                .try_into()
+                .unwrap(),
+        );
+        let Ok(payload_len) = usize::try_from(payload_len) else {
+            warn!("persistent cache payload is too large");
+            quarantine_corrupt(path);
+            return;
+        };
+        if HEADER_LENGTH.checked_add(payload_len) != Some(bytes.len()) {
             warn!("persistent cache file length does not match its header");
             quarantine_corrupt(path);
             return;
         }
 
-        let payload = &bytes[MAGIC.len() + 12..];
+        let payload = &bytes[HEADER_LENGTH..];
         let persisted: PersistedCache = match serde_json::from_slice(payload) {
             Ok(cache) => cache,
             Err(error) => {
@@ -343,6 +409,10 @@ impl PersistentDnsCache {
             }
         };
 
+        if persisted.policy != self.policy {
+            tracing::info!("persistent cache policy changed; discarding saved entries");
+            return;
+        }
         let now = SystemTime::now();
         for entry in persisted.entries {
             if now > entry.stale_system_time() {
@@ -403,14 +473,10 @@ fn response_ttl(message: &Message, max_ttl: Duration) -> Duration {
             min_ttl = Some(min_ttl.map_or(ttl, |current: Duration| current.min(ttl)));
         }
     }
-    min_ttl
-        .unwrap_or(max_ttl)
-        .min(max_ttl)
-        .max(Duration::from_secs(1))
+    min_ttl.unwrap_or(max_ttl).min(max_ttl)
 }
 
-fn decrement_message(message: &Message, elapsed: Duration) -> Message {
-    let mut message = message.clone();
+fn decrement_message(mut message: Message, elapsed: Duration) -> Message {
     let elapsed = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
     for records in [
         &mut message.answers,
@@ -424,8 +490,7 @@ fn decrement_message(message: &Message, elapsed: Duration) -> Message {
     message
 }
 
-fn zero_ttl_message(message: &Message) -> Message {
-    let mut message = message.clone();
+fn zero_ttl_message(mut message: Message) -> Message {
     for records in [
         &mut message.answers,
         &mut message.authorities,
@@ -480,6 +545,79 @@ mod tests {
             serve_stale,
             stale_ttl: Duration::from_secs(2),
         }
+    }
+
+    #[test]
+    fn zero_ttl_answers_are_excluded_from_fresh_and_stale_cache() {
+        let cache = PersistentDnsCache::new(&config(false, true, None));
+        let name = Name::from_ascii("example.com.").unwrap();
+        let key = CacheKey {
+            name: name.clone(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        let mut answer = message();
+        answer.add_answer(hickory_server::proto::rr::Record::from_rdata(
+            name,
+            0,
+            hickory_server::proto::rr::RData::A(hickory_server::proto::rr::rdata::A::new(
+                192, 0, 2, 1,
+            )),
+        ));
+        let now = SystemTime::now();
+        cache.insert(key.clone(), answer, now);
+        assert!(cache.get(&key, now).is_none());
+        assert!(cache.get(&key, now + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn stale_answers_clear_authentication() {
+        use hickory_server::proto::dnssec::Proof;
+        use hickory_server::proto::rr::{RData, Record, rdata::A};
+        let mut cfg = config(false, true, None);
+        cfg.max_ttl = Duration::from_secs(1);
+        let cache = PersistentDnsCache::new(&cfg);
+        let name = Name::from_ascii("example.com.").unwrap();
+        let key = CacheKey {
+            name: name.clone(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: true,
+        };
+        let mut answer = message();
+        answer.metadata.authentic_data = true;
+        let mut record = Record::from_rdata(name, 1, RData::A(A::new(192, 0, 2, 1)));
+        record.proof = Proof::Secure;
+        answer.add_answer(record);
+        let now = SystemTime::now();
+        cache.insert(key.clone(), answer, now - Duration::from_secs(2));
+        let (answer, stale) = cache.get(&key, now).unwrap();
+        assert!(stale);
+        assert!(!answer.metadata.authentic_data);
+        assert!(!answer.answers[0].proof.is_secure());
+        assert_eq!(answer.answers[0].ttl, 0);
+    }
+
+    #[tokio::test]
+    async fn persisted_entries_require_the_original_resolver_policy() {
+        let directory = tempdir().unwrap();
+        let cfg = config(true, false, Some(directory.path().join("cache.json")));
+        let key = CacheKey {
+            name: Name::from_ascii("example.com.").unwrap(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        let cache = PersistentDnsCache::open_for_policy(&cfg, "initial policy".into(), true).await;
+        cache.insert(key.clone(), message(), SystemTime::now());
+        cache.flush().unwrap();
+        let matching =
+            PersistentDnsCache::open_for_policy(&cfg, "initial policy".into(), true).await;
+        assert!(matching.get(&key, SystemTime::now()).is_some());
+        let changed =
+            PersistentDnsCache::open_for_policy(&cfg, "stricter policy".into(), true).await;
+        assert!(changed.get(&key, SystemTime::now()).is_none());
     }
 
     #[test]

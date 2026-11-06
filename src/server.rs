@@ -41,6 +41,8 @@ use crate::tls::{TlsState, install_crypto_provider};
 
 pub type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+const LISTENER_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 const RATE_LIMITER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
@@ -52,6 +54,7 @@ enum ReloadTrigger {
 struct ReloadContext {
     config: Arc<ArcSwap<Config>>,
     config_path: Option<PathBuf>,
+    recursor_signature: Mutex<String>,
     resolver: RecursorHandle,
     cache_handle: Arc<ArcSwap<Option<Arc<PersistentDnsCache>>>>,
     inflight: Arc<ArcSwap<Arc<Semaphore>>>,
@@ -82,6 +85,11 @@ pub async fn run_with_logging(
     logging_reload: Option<ReloadHandle>,
 ) -> anyhow::Result<()> {
     install_crypto_provider();
+    let shutdown = shutdown_signal()?;
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("failed to install SIGHUP handler")?;
+    let signature = recursor_signature(&config)?;
 
     let config_store = Arc::new(ArcSwap::from_pointee(config.clone()));
     let stats = Arc::new(Stats::default());
@@ -89,7 +97,9 @@ pub async fn run_with_logging(
         .map_err(|error| anyhow::anyhow!("failed to install metrics recorder: {error}"))?;
     let cache_handle = Arc::new(ArcSwap::from_pointee(
         if config.cache.persistent || config.cache.serve_stale {
-            Some(Arc::new(PersistentDnsCache::open(&config.cache).await))
+            Some(Arc::new(
+                PersistentDnsCache::open_for_policy(&config.cache, signature.clone(), true).await,
+            ))
         } else {
             None
         },
@@ -158,7 +168,7 @@ pub async fn run_with_logging(
                 .limits
                 .effective(listener.protocol)
                 .max_concurrent_requests
-                .unwrap_or(128) as usize;
+                .expect("DoH request limit") as usize;
             let landing_html = config
                 .landing_page
                 .read_html()
@@ -257,14 +267,10 @@ pub async fn run_with_logging(
     let sighup_task = Some(tokio::spawn({
         let tx = trigger_tx.clone();
         async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut signal = match signal(SignalKind::hangup()) {
-                Ok(signal) => signal,
-                Err(_) => return,
-            };
-            loop {
-                signal.recv().await;
-                let _ = tx.send(ReloadTrigger::Signal);
+            while sighup.recv().await.is_some() {
+                if tx.send(ReloadTrigger::Signal).is_err() {
+                    break;
+                }
             }
         }
     }));
@@ -273,6 +279,7 @@ pub async fn run_with_logging(
 
     let reload_context = Arc::new(ReloadContext {
         config: config_store.clone(),
+        recursor_signature: Mutex::new(signature),
         config_path: config_path.clone(),
         resolver: resolver_handle.clone(),
         cache_handle: cache_handle.clone(),
@@ -298,7 +305,23 @@ pub async fn run_with_logging(
 
     ready.store(true, Ordering::Relaxed);
 
-    shutdown_signal().await?;
+    let mut health_interval = tokio::time::interval(LISTENER_HEALTH_INTERVAL);
+    tokio::pin!(shutdown);
+    let listener_failed = loop {
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                break false;
+            }
+            _ = health_interval.tick() => {
+                if runtimes.lock().unwrap().iter().any(|runtime| runtime.task.is_finished()) {
+                    tracing::error!("listener stopped unexpectedly");
+                    break true;
+                }
+            }
+        }
+    };
+    ready.store(false, Ordering::Relaxed);
     tracing::info!("shutdown requested");
     cleanup_token.cancel();
     cleanup_task.abort();
@@ -306,11 +329,6 @@ pub async fn run_with_logging(
     cache_flush_token.cancel();
     cache_flush_task.abort();
     let _ = cache_flush_task.await;
-    if let Some(cache) = cache_handle.load_full().as_ref().clone()
-        && let Err(error) = cache.flush_async().await
-    {
-        tracing::warn!(error = %error, "failed to flush persistent cache");
-    }
     reload_task.abort();
     let _ = reload_task.await;
     if let Some(task) = sighup_task {
@@ -327,11 +345,13 @@ pub async fn run_with_logging(
     let runtimes = std::mem::take(&mut *runtimes.lock().unwrap());
     for runtime in runtimes {
         let ListenerRuntime {
-            name, token, task, ..
+            name,
+            token,
+            mut task,
+            ..
         } = runtime;
         token.cancel();
-        let abort = task.abort_handle();
-        match tokio::time::timeout_at(deadline, task).await {
+        match tokio::time::timeout_at(deadline, &mut task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => {
                 tracing::warn!(listener = %name, error = %error, "listener stopped with an error");
@@ -340,7 +360,8 @@ pub async fn run_with_logging(
                 tracing::warn!(listener = %name, error = %error, "listener task failed");
             }
             Err(_) => {
-                abort.abort();
+                task.abort();
+                let _ = task.await;
                 tracing::warn!(
                     listener = %name,
                     grace_ms = shutdown_grace.as_millis(),
@@ -348,6 +369,15 @@ pub async fn run_with_logging(
                 );
             }
         }
+    }
+
+    if let Some(cache) = cache_handle.load_full().as_ref().clone()
+        && let Err(error) = cache.flush_async().await
+    {
+        tracing::warn!(error = %error, "failed to flush persistent cache");
+    }
+    if listener_failed {
+        anyhow::bail!("listener stopped unexpectedly");
     }
 
     let snapshot = stats.snapshot();
@@ -402,7 +432,7 @@ async fn reload_loop(
                     dirty = true;
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+            _ = tokio::time::sleep(RELOAD_DEBOUNCE) => {
                 dirty = false;
                 if watcher.is_some() {
                     match reload_once(&ctx, tx.clone()).await {
@@ -433,22 +463,25 @@ async fn reload_once(
     let new_config = Config::load(config_path)?;
     let new_filter = build_filter(&new_config.logging)?;
 
-    let recursor_settings_changed =
-        recursor_signature(&current_config) != recursor_signature(&new_config);
+    let signature = recursor_signature(&new_config)?;
+    let recursor_settings_changed = *ctx.recursor_signature.lock().unwrap() != signature;
     let cache_changed = current_config.cache != new_config.cache;
     let recursor_changed = recursor_settings_changed || cache_changed;
 
-    let new_cache = if cache_changed {
+    let new_cache = if recursor_changed {
         if new_config.cache.persistent || new_config.cache.serve_stale {
-            Some(Arc::new(PersistentDnsCache::open(&new_config.cache).await))
+            Some(Arc::new(
+                PersistentDnsCache::open_for_policy(&new_config.cache, signature.clone(), false)
+                    .await,
+            ))
         } else {
             None
         }
     } else {
         None
     };
-    let new_cache_handle =
-        cache_changed.then(|| Arc::new(ArcSwap::from_pointee(new_cache.as_ref().map(Arc::clone))));
+    let new_cache_handle = recursor_changed
+        .then(|| Arc::new(ArcSwap::from_pointee(new_cache.as_ref().map(Arc::clone))));
 
     let new_resolver = if recursor_changed {
         let base = build_recursor(&new_config)?;
@@ -559,20 +592,22 @@ async fn reload_once(
                 None
             };
 
-            let dot_max_connections = if new_listener.protocol == Protocol::Dot
-                && old_limits.is_none_or(|old| old.max_connections != limits.max_connections)
-            {
-                let max_connections = limits.max_connections.unwrap_or(512) as usize;
-                Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
-                    max_connections,
-                )))))
-            } else {
-                None
-            };
+            let dot_max_connections =
+                if matches!(new_listener.protocol, Protocol::Tcp | Protocol::Dot)
+                    && old_limits.is_none_or(|old| old.max_connections != limits.max_connections)
+                {
+                    let max_connections =
+                        limits.max_connections.expect("stream connection limit") as usize;
+                    Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
+                        max_connections,
+                    )))))
+                } else {
+                    None
+                };
 
             let doh_runtime = if new_listener.protocol == Protocol::Doh {
                 let max_concurrent_requests =
-                    limits.max_concurrent_requests.unwrap_or(128) as usize;
+                    limits.max_concurrent_requests.expect("DoH request limit") as usize;
                 let concurrency = old_runtime
                     .doh_runtime
                     .as_ref()
@@ -601,7 +636,8 @@ async fn reload_once(
             let doh_max_connections = if new_listener.protocol == Protocol::Doh
                 && old_limits.is_none_or(|old| old.max_connections != limits.max_connections)
             {
-                let max_connections = limits.max_connections.unwrap_or(512) as usize;
+                let max_connections =
+                    limits.max_connections.expect("stream connection limit") as usize;
                 Some(Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
                     max_connections,
                 )))))
@@ -656,18 +692,14 @@ async fn reload_once(
             .map_err(|error| anyhow::anyhow!("failed to reload logging: {error}"))?;
     }
 
-    if cache_changed {
-        if let Some(cache) = &new_cache
-            && let Err(error) = cache.clear_async().await
-        {
-            tracing::warn!(error = %error, "failed to clear persistent cache");
+    if recursor_changed {
+        if let Some(cache) = &new_cache {
+            cache
+                .clear_async()
+                .await
+                .context("failed to clear persistent cache")?;
         }
         ctx.cache_handle.store(Arc::new(new_cache));
-    } else if recursor_settings_changed
-        && let Some(cache) = ctx.cache_handle.load_full().as_ref().clone()
-        && let Err(error) = cache.clear_async().await
-    {
-        tracing::warn!(error = %error, "failed to clear persistent cache");
     }
 
     if let Some(resolver) = new_resolver {
@@ -677,6 +709,7 @@ async fn reload_once(
         ctx.inflight.store(Arc::new(inflight));
     }
 
+    *ctx.recursor_signature.lock().unwrap() = signature;
     ctx.config.store(Arc::new(new_config));
 
     let mut old_runtimes = ctx.runtimes.lock().unwrap();
@@ -753,22 +786,29 @@ pub fn build_filter(logging: &crate::config::LoggingConfig) -> anyhow::Result<En
         .map_err(|error| anyhow::anyhow!("failed to build logging filter: {error}"))
 }
 
-fn recursor_signature(config: &Config) -> String {
+fn recursor_signature(config: &Config) -> anyhow::Result<String> {
     let root_bytes = config
         .recursor
         .root_hints
         .as_ref()
-        .map(|path| fs::read(path).unwrap_or_default());
+        .map(|path| fs::read(path).with_context(|| format!("failed to read {}", path.display())))
+        .transpose()?;
     let trust_bytes = config
         .dnssec
         .trust_anchor
         .as_ref()
-        .map(|path| fs::read(path).unwrap_or_default());
+        .map(|path| fs::read(path).with_context(|| format!("failed to read {}", path.display())))
+        .transpose()?;
 
-    format!(
-        "{:?}{:?}{:?}{:?}",
-        config.recursor, config.dnssec, root_bytes, trust_bytes
-    )
+    Ok(format!(
+        "{}{:?}{:?}{:?}{:?}{:?}",
+        env!("CARGO_PKG_VERSION"),
+        config.recursor,
+        config.dnssec,
+        config.cache,
+        root_bytes,
+        trust_bytes
+    ))
 }
 
 fn watched_paths(config: &Config, config_path: &Path) -> HashSet<PathBuf> {
@@ -787,7 +827,12 @@ fn watched_paths(config: &Config, config_path: &Path) -> HashSet<PathBuf> {
     for path in &config.blocklist.rpz_paths {
         paths.insert(path.clone());
     }
+    paths.extend(config.landing_page.html.iter().cloned());
+    paths.extend(config.landing_page.css.iter().cloned());
     paths
+        .into_iter()
+        .map(|path| std::path::absolute(&path).unwrap_or(path))
+        .collect()
 }
 
 fn build_watcher(
@@ -853,6 +898,73 @@ mod tests {
 
     use crate::persistent_cache::{CacheKey, PersistentDnsCache};
 
+    #[test]
+    fn recursor_signature_tracks_file_contents_and_read_errors() {
+        let directory = tempdir().unwrap();
+        let hints = directory.path().join("root.hints");
+        fs::write(&hints, include_str!("../assets/root.hints")).unwrap();
+        let mut config = Config::from_toml_str(
+            "[[listeners]]\nname = 'test'\nprotocol = 'udp'\naddress = '127.0.0.1:0'",
+        )
+        .unwrap();
+        config.recursor.root_hints = Some(hints.clone());
+        let initial = recursor_signature(&config).unwrap();
+        fs::write(&hints, "changed contents").unwrap();
+        assert_ne!(initial, recursor_signature(&config).unwrap());
+        fs::remove_file(&hints).unwrap();
+        assert!(recursor_signature(&config).is_err());
+    }
+
+    #[test]
+    fn landing_files_are_watched_as_absolute_paths() {
+        let mut config = Config::from_toml_str(
+            "[[listeners]]\nname = 'test'\nprotocol = 'udp'\naddress = '127.0.0.1:0'",
+        )
+        .unwrap();
+        config.landing_page.html = Some("landing.html".into());
+        config.landing_page.css = Some("landing.css".into());
+        let paths = watched_paths(&config, Path::new("echoic.toml"));
+        for path in ["echoic.toml", "landing.html", "landing.css"] {
+            assert!(paths.contains(&std::path::absolute(path).unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_detects_replaced_root_hints_and_preserves_state_on_failure() {
+        let directory = tempdir().unwrap();
+        let config_path = directory.path().join("echoic.toml");
+        let hints = directory.path().join("root.hints");
+        fs::write(&hints, include_str!("../assets/root.hints")).unwrap();
+        fs::write(&config_path, "[dnssec]\nenabled = false\n[recursor]\nroot_hints = 'root.hints'\n[[listeners]]\nname = 'test'\nprotocol = 'udp'\naddress = '127.0.0.1:0'").unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let resolver = build_recursor(&config).unwrap();
+        let signature = recursor_signature(&config).unwrap();
+        let ctx = ReloadContext {
+            config: Arc::new(ArcSwap::from_pointee(config)),
+            config_path: Some(config_path),
+            recursor_signature: Mutex::new(signature.clone()),
+            resolver: RecursorHandle::new(resolver.clone()),
+            cache_handle: Arc::new(ArcSwap::from_pointee(None)),
+            inflight: Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(1)))),
+            runtimes: Arc::new(Mutex::new(Vec::new())),
+            logging_reload: None,
+            limiters: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        fs::write(&hints, "invalid hints").unwrap();
+        assert!(reload_once(&ctx, tx.clone()).await.is_err());
+        assert!(Arc::ptr_eq(&resolver, &ctx.resolver.current()));
+        assert_eq!(*ctx.recursor_signature.lock().unwrap(), signature);
+        fs::write(
+            &hints,
+            format!("{}\n", include_str!("../assets/root.hints")),
+        )
+        .unwrap();
+        reload_once(&ctx, tx).await.unwrap();
+        assert!(!Arc::ptr_eq(&resolver, &ctx.resolver.current()));
+        assert_ne!(*ctx.recursor_signature.lock().unwrap(), signature);
+    }
+
     #[tokio::test]
     async fn reload_rebuilds_recursor_and_clears_persistent_cache() {
         let directory = tempdir().expect("temporary directory");
@@ -913,6 +1025,7 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config.clone())),
             config_path: Some(config_path.clone()),
             resolver: resolver.clone(),
@@ -931,6 +1044,8 @@ address = "127.0.0.1:0"
         assert!(resolver.is_validating());
         let reloaded_loaded = cache_handle.load_full();
         let reloaded_cache = reloaded_loaded.as_ref().as_ref().expect("cache");
+        assert!(!Arc::ptr_eq(cache, reloaded_cache));
+        cache.insert(key.clone(), Message::query(), SystemTime::now());
         assert!(reloaded_cache.get(&key, SystemTime::now()).is_none());
         assert!(!cache_path.exists());
     }
@@ -995,6 +1110,7 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config.clone())),
             config_path: Some(config_path.clone()),
             resolver: resolver.clone(),
@@ -1093,6 +1209,7 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config)),
             config_path: Some(config_path.clone()),
             resolver: resolver.clone(),
@@ -1163,27 +1280,23 @@ address = "127.0.0.1:0"
     }
 }
 
-async fn shutdown_signal() -> anyhow::Result<()> {
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut terminate =
-            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler")?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to install SIGINT handler")?;
+    Ok(async move {
+        #[cfg(unix)]
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("failed to wait for interrupt signal")?;
-            }
+            _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
-    }
-
-    #[cfg(not(unix))]
-    {
+        #[cfg(not(unix))]
         tokio::signal::ctrl_c()
             .await
             .context("failed to wait for interrupt signal")?;
-    }
-
-    Ok(())
+        Ok(())
+    })
 }

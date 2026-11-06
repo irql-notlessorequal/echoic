@@ -92,6 +92,41 @@ fn check_config_rejects_missing_file() {
 }
 
 #[test]
+fn check_files_loads_referenced_dns_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("echoic.toml");
+    let config = "[recursor]\nroot_hints = 'root.hints'\n[[listeners]]\nname = 'test'\nprotocol = 'udp'\naddress = '127.0.0.1:0'";
+    std::fs::write(&config_path, config).unwrap();
+    let output = echoic()
+        .args(["--check-config", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = echoic()
+        .args(["--check-config", "--check-files", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    std::fs::write(
+        directory.path().join("root.hints"),
+        include_str!("../assets/root.hints"),
+    )
+    .unwrap();
+    let output = echoic()
+        .args(["--check-config", "--check-files", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn normal_startup_initializes_logging_and_starts_listeners() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let config_path = directory.path().join("echoic.toml");

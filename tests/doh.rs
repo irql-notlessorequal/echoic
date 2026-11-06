@@ -514,6 +514,86 @@ async fn rejected_request_does_not_wait_for_body() {
     stop(child);
 }
 
+#[tokio::test]
+async fn accepted_post_body_has_a_deadline() {
+    let (child, port) = start_server();
+    let request = b"POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: 100\r\n\r\nx";
+    let response = tokio::time::timeout(Duration::from_secs(7), raw_tls_exchange(port, request))
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 408"));
+    stop(child);
+}
+
+#[tokio::test]
+async fn uri_limit_covers_all_parameters_before_decoding() {
+    let (child, port) = start_server();
+    let request = format!(
+        "GET /dns-query?unused={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "x".repeat(1100)
+    );
+    let response = raw_tls_exchange(port, request.as_bytes()).await;
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 414"));
+    stop(child);
+}
+
+#[tokio::test]
+async fn metrics_exposes_counters_and_available_capacity() {
+    let (child, port) = start_server();
+    let response = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve(
+            "localhost",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .build()
+        .unwrap()
+        .get(format!("https://localhost:{port}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("echoic_requests_total 0"));
+    assert!(body.contains("echoic_query_permits_available 2048"));
+    assert!(body.contains("echoic_query_duration_seconds_count 0"));
+    stop(child);
+}
+
+#[tokio::test]
+async fn landing_files_reload_without_a_signal() {
+    let directory = tempfile::tempdir().unwrap();
+    let html = directory.path().join("landing.html");
+    std::fs::write(&html, "initial landing").unwrap();
+    let (child, port) =
+        start_server_with_listener(&format!("[landing_page]\nhtml = '{}'", html.display()));
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve(
+            "localhost",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .build()
+        .unwrap();
+    let url = format!("https://localhost:{port}/");
+    let initial = client.get(&url).send().await.unwrap().text().await.unwrap();
+    assert_eq!(initial, "initial landing");
+    std::fs::write(&html, "updated landing").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let body = client.get(&url).send().await.unwrap().text().await.unwrap();
+        if body == "updated landing" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "landing file failed to reload"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    stop(child);
+}
+
 async fn raw_tls_exchange(port: u16, request: &[u8]) -> Vec<u8> {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

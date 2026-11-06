@@ -26,15 +26,13 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use hickory_server::net::NetError;
 use hickory_server::server::Server;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ListenerConfig, Protocol};
 use crate::net::apply_dscp;
 use crate::query::{ListenerQueryState, QueryService};
-
-const TCP_RESPONSE_BUFFER_SIZE: usize = 32;
 
 pub(crate) fn apply_listener_dscp(
     listener: &ListenerConfig,
@@ -62,6 +60,7 @@ pub struct ListenerRuntime {
     pub token: CancellationToken,
     pub query_state: Arc<ArcSwap<ListenerQueryState>>,
     pub tls_state: Arc<ArcSwap<Option<Arc<crate::tls::TlsState>>>>,
+    /// Connection capacity shared by TCP and DoT listener implementations.
     pub dot_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
     pub doh_runtime: Option<Arc<ArcSwap<crate::doh::DohRuntimeState>>>,
     pub doh_max_connections: Option<Arc<ArcSwap<Arc<tokio::sync::Semaphore>>>>,
@@ -81,78 +80,65 @@ impl ListenerRuntime {
 pub async fn start_listener(
     listener: &ListenerConfig,
     service: QueryService,
-    request_timeout: Duration,
+    _request_timeout: Duration,
 ) -> anyhow::Result<ListenerRuntime> {
-    let query_state = service.state();
-    let mut server = Server::new(service);
-    let token = server.shutdown_token().clone();
+    if listener.protocol == Protocol::Tcp {
+        return crate::dot::start_stream_listener(listener, service, None).await;
+    } else {
+        let query_state = service.state();
+        let mut server = Server::new(service);
+        let token = server.shutdown_token().clone();
 
-    let bound_address = match listener.protocol {
-        Protocol::Udp => {
-            let socket = UdpSocket::bind(listener.address).await.with_context(|| {
-                format!(
-                    "listener {:?}: failed to bind UDP socket {}",
-                    listener.name, listener.address
-                )
-            })?;
-            let bound_address = socket.local_addr().with_context(|| {
-                format!(
-                    "listener {:?}: failed to inspect UDP socket {}",
-                    listener.name, listener.address
-                )
-            })?;
-            apply_listener_dscp(listener, &socket, bound_address);
-            server.register_socket(socket);
-            bound_address
-        }
-        Protocol::Tcp => {
-            let socket = TcpListener::bind(listener.address).await.with_context(|| {
-                format!(
-                    "listener {:?}: failed to bind TCP socket {}",
-                    listener.name, listener.address
-                )
-            })?;
-            let bound_address = socket.local_addr().with_context(|| {
-                format!(
-                    "listener {:?}: failed to inspect TCP socket {}",
-                    listener.name, listener.address
-                )
-            })?;
-            apply_listener_dscp(listener, &socket, bound_address);
-            server.register_listener(socket, request_timeout, TCP_RESPONSE_BUFFER_SIZE);
-            bound_address
-        }
-        Protocol::Dot | Protocol::Doh => {
-            bail!(
-                "listener {:?}: {} listeners are not implemented yet",
-                listener.name,
-                listener.protocol.as_str()
-            );
-        }
-    };
+        let bound_address = match listener.protocol {
+            Protocol::Udp => {
+                let socket = UdpSocket::bind(listener.address).await.with_context(|| {
+                    format!(
+                        "listener {:?}: failed to bind UDP socket {}",
+                        listener.name, listener.address
+                    )
+                })?;
+                let bound_address = socket.local_addr().with_context(|| {
+                    format!(
+                        "listener {:?}: failed to inspect UDP socket {}",
+                        listener.name, listener.address
+                    )
+                })?;
+                apply_listener_dscp(listener, &socket, bound_address);
+                server.register_socket(socket);
+                bound_address
+            }
+            Protocol::Tcp | Protocol::Dot | Protocol::Doh => {
+                bail!(
+                    "listener {:?}: {} listeners are not implemented yet",
+                    listener.name,
+                    listener.protocol.as_str()
+                );
+            }
+        };
 
-    tracing::info!(
-        listener = %listener.name,
-        protocol = listener.protocol.as_str(),
-        address = %bound_address,
-        "listener started"
-    );
+        tracing::info!(
+            listener = %listener.name,
+            protocol = listener.protocol.as_str(),
+            address = %bound_address,
+            "listener started"
+        );
 
-    let task = tokio::spawn(async move { server.block_until_done().await });
+        let task = tokio::spawn(async move { server.block_until_done().await });
 
-    Ok(ListenerRuntime {
-        name: listener.name.clone(),
-        protocol: listener.protocol,
-        address: listener.address,
-        bound_address,
-        token,
-        query_state,
-        tls_state: Arc::new(ArcSwap::from_pointee(None)),
-        dscp: listener.dscp,
-        configured_dscp: listener.dscp,
-        dot_max_connections: None,
-        doh_runtime: None,
-        doh_max_connections: None,
-        task,
-    })
+        Ok(ListenerRuntime {
+            name: listener.name.clone(),
+            protocol: listener.protocol,
+            address: listener.address,
+            bound_address,
+            token,
+            query_state,
+            tls_state: Arc::new(ArcSwap::from_pointee(None)),
+            dscp: listener.dscp,
+            configured_dscp: listener.dscp,
+            dot_max_connections: None,
+            doh_runtime: None,
+            doh_max_connections: None,
+            task,
+        })
+    }
 }

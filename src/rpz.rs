@@ -45,20 +45,20 @@ fn merge_local_data(existing: &mut RpzAction, action: RpzAction) {
 #[derive(Debug, Clone)]
 pub struct RpzPolicy {
     exact: HashMap<LowerName, RpzAction>,
-    wildcards: Vec<(LowerName, RpzAction)>,
+    wildcards: HashMap<LowerName, RpzAction>,
 }
 
 impl RpzPolicy {
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             exact: HashMap::new(),
-            wildcards: Vec::new(),
+            wildcards: HashMap::new(),
         })
     }
 
     pub fn load(paths: &[std::path::PathBuf], origin: Option<&str>) -> anyhow::Result<Arc<Self>> {
         let mut exact = HashMap::new();
-        let mut wildcards = Vec::new();
+        let mut wildcards = HashMap::new();
         let configured_origin = origin
             .map(Name::from_str)
             .transpose()
@@ -157,13 +157,10 @@ impl RpzPolicy {
                             anyhow::anyhow!("invalid RPZ wildcard {trigger_name}: {error}")
                         })?
                     };
-                    if let Some((_, existing)) = wildcards
-                        .iter_mut()
-                        .find(|(existing, _)| existing == &suffix)
-                    {
+                    if let Some(existing) = wildcards.get_mut(&suffix) {
                         merge_local_data(existing, action);
                     } else {
-                        wildcards.push((suffix, action));
+                        wildcards.insert(suffix, action);
                     }
                 } else if let Some(existing) = exact.get_mut(&trigger) {
                     merge_local_data(existing, action);
@@ -172,13 +169,6 @@ impl RpzPolicy {
                 }
             }
         }
-
-        wildcards.sort_by(|(left, _), (right, _)| {
-            right
-                .num_labels()
-                .cmp(&left.num_labels())
-                .then_with(|| right.to_string().len().cmp(&left.to_string().len()))
-        });
 
         Ok(Arc::new(Self { exact, wildcards }))
     }
@@ -189,10 +179,15 @@ impl RpzPolicy {
             return Some(action.clone());
         }
 
-        for (suffix, action) in &self.wildcards {
-            if *suffix != lower && suffix.zone_of(&lower) {
+        let mut suffix = name.base_name();
+        while &suffix != name {
+            if let Some(action) = self.wildcards.get(&LowerName::new(&suffix)) {
                 return Some(action.clone());
             }
+            if suffix.is_root() {
+                break;
+            }
+            suffix = suffix.base_name();
         }
 
         None

@@ -118,7 +118,7 @@ impl RecursorHandle {
 
 pub struct CachedRecursiveResolver {
     inner: Arc<dyn RecursiveResolver>,
-    cache: Arc<arc_swap::ArcSwap<Option<Arc<crate::persistent_cache::PersistentDnsCache>>>>,
+    cache: Option<Arc<crate::persistent_cache::PersistentDnsCache>>,
 }
 
 impl CachedRecursiveResolver {
@@ -126,7 +126,10 @@ impl CachedRecursiveResolver {
         inner: Arc<dyn RecursiveResolver>,
         cache: Arc<arc_swap::ArcSwap<Option<Arc<crate::persistent_cache::PersistentDnsCache>>>>,
     ) -> Self {
-        Self { inner, cache }
+        Self {
+            inner,
+            cache: cache.load_full().as_ref().clone(),
+        }
     }
 }
 
@@ -146,8 +149,7 @@ impl RecursiveResolver for CachedRecursiveResolver {
         use crate::persistent_cache::CacheKey;
         use std::time::SystemTime;
 
-        let cache = self.cache.load_full();
-        let Some(cache) = cache.as_ref() else {
+        let Some(cache) = self.cache.as_ref() else {
             return self
                 .inner
                 .resolve(query.clone(), dnssec_ok)
@@ -177,7 +179,7 @@ impl RecursiveResolver for CachedRecursiveResolver {
 
         match self.inner.resolve(query.clone(), dnssec_ok).await {
             Ok(message) => {
-                cache.insert(key, message.clone(), now);
+                cache.insert(key, message.clone(), SystemTime::now());
                 Ok(ResolvedResponse {
                     message,
                     stale: false,
@@ -185,7 +187,7 @@ impl RecursiveResolver for CachedRecursiveResolver {
                 })
             }
             Err(error) if cache.config().serve_stale && !is_negative_recursor_error(&error) => {
-                if let Some((message, true)) = cache.get(&key, now) {
+                if let Some((message, true)) = cache.get(&key, SystemTime::now()) {
                     return Ok(ResolvedResponse {
                         message,
                         stale: true,
@@ -202,10 +204,7 @@ impl RecursiveResolver for CachedRecursiveResolver {
         use crate::persistent_cache::CacheKey;
         use std::time::SystemTime;
 
-        let loaded = self.cache.load_full();
-        let Some(cache) = loaded.as_ref() else {
-            return None;
-        };
+        let cache = self.cache.as_ref()?;
         let key = CacheKey {
             name: query.name().clone().to_lowercase(),
             qtype: query.query_type(),
@@ -425,6 +424,52 @@ fn load_roots(config: &crate::config::RecursorConfig) -> anyhow::Result<Vec<IpAd
 mod tests {
     use super::*;
     use crate::config::RecursorConfig;
+
+    struct CacheOnlyResolver;
+
+    #[async_trait]
+    impl RecursiveResolver for CacheOnlyResolver {
+        async fn resolve(&self, _query: Query, _dnssec_ok: bool) -> Result<Message, RecursorError> {
+            Err(RecursorError::Message("unexpected upstream lookup"))
+        }
+
+        fn is_validating(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_keeps_its_cache_when_the_shared_handle_is_replaced() {
+        use crate::persistent_cache::{CacheKey, PersistentDnsCache};
+        use hickory_server::proto::rr::{DNSClass, RecordType};
+        let config = crate::config::CacheConfig::default();
+        let original = Arc::new(PersistentDnsCache::new(&config));
+        let handle = Arc::new(ArcSwap::from_pointee(Some(original.clone())));
+        let resolver = CachedRecursiveResolver::new(Arc::new(CacheOnlyResolver), handle.clone());
+        let name = Name::from_ascii("example.com.").unwrap();
+        let key = CacheKey {
+            name: name.clone(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: false,
+        };
+        let mut message = Message::response(41, hickory_server::proto::op::OpCode::Query);
+        message.add_query(Query::query(name.clone(), RecordType::A));
+        original.insert(key.clone(), message, std::time::SystemTime::now());
+        let replacement = Arc::new(PersistentDnsCache::new(&config));
+        handle.store(Arc::new(Some(replacement.clone())));
+        let response = resolver
+            .resolve_cached(Query::query(name, RecordType::A), false)
+            .await
+            .unwrap();
+        assert!(response.cache_hit);
+        assert_eq!(response.message.metadata.id, 41);
+        assert!(
+            replacement
+                .get(&key, std::time::SystemTime::now())
+                .is_none()
+        );
+    }
 
     #[test]
     fn embedded_root_hints_contain_addresses() {

@@ -287,7 +287,7 @@ impl QueryService {
     async fn send_status<R: ResponseHandler>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
         response_code: ResponseCode,
         extended_error: Option<ExtendedDnsError>,
         state: &ListenerQueryState,
@@ -297,50 +297,27 @@ impl QueryService {
         metadata.recursion_available = true;
         metadata.response_code = response_code;
 
-        let mut edns = response_edns(request, state, self.protocol, extended_error);
-        if let Some(edns) = &mut edns {
-            edns.options_mut().remove(EdnsCode::Padding);
-        }
-        if padding_requested(request, state)
-            && let Some(edns) = &mut edns
-        {
-            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns))
-                .build_no_records(metadata);
-            let mut measurement_bytes = Vec::with_capacity(512);
-            let mut measurement_encoder =
-                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-            let _ = measurement.destructive_emit(&mut measurement_encoder);
-            let pad_len = padding_len(state, measurement_bytes.len());
-            edns.options_mut().insert(EdnsOption::Unknown(
-                EdnsCode::Padding.into(),
-                vec![0; pad_len],
-            ));
-        }
-
-        let response =
-            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
-
-        match response_handle.send_response(response).await {
-            Ok(info) => {
-                self.record_response(request, response_code, state, started, false);
-                info
-            }
-            Err(error) => {
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    error = %error,
-                    "failed to send DNS response"
-                );
-                drop_response(request)
-            }
-        }
+        let mut message = hickory_server::proto::op::Message::response(
+            request.metadata.id,
+            request.metadata.op_code,
+        );
+        message.metadata = metadata;
+        self.send_response(
+            request,
+            response_handle,
+            message,
+            extended_error,
+            state,
+            started,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn send_message<R: ResponseHandler>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
         mut message: hickory_server::proto::op::Message,
         extended_error: Option<ExtendedDnsError>,
         state: &ListenerQueryState,
@@ -397,31 +374,53 @@ impl QueryService {
             )
             && message_is_secure(&message);
 
+        message.metadata = metadata;
+        self.send_response(
+            request,
+            response_handle,
+            message,
+            extended_error,
+            state,
+            started,
+        )
+        .await
+    }
+
+    async fn send_response<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        message: hickory_server::proto::op::Message,
+        extended_error: Option<ExtendedDnsError>,
+        state: &ListenerQueryState,
+        started: Instant,
+    ) -> ResponseInfo {
+        let metadata = message.metadata;
         let mut edns = response_edns(request, state, self.protocol, extended_error);
         if let Some(edns) = &mut edns {
             edns.options_mut().remove(EdnsCode::Padding);
+            if padding_requested(request, state) {
+                let measurement = MessageResponseBuilder::new(&request.queries, Some(edns)).build(
+                    metadata,
+                    &message.answers,
+                    &message.authorities,
+                    iter::empty::<&Record>(),
+                    &message.additionals,
+                );
+                let mut bytes = Vec::new();
+                let mut encoder =
+                    hickory_server::proto::serialize::binary::BinEncoder::new(&mut bytes);
+                match measurement.destructive_emit(&mut encoder) {
+                    Ok(_) => {
+                        edns.options_mut().insert(EdnsOption::Unknown(
+                            EdnsCode::Padding.into(),
+                            vec![0; padding_len(state, bytes.len())],
+                        ));
+                    }
+                    Err(error) => tracing::debug!(%error, "failed to measure DNS response padding"),
+                }
+            }
         }
-        if padding_requested(request, state)
-            && let Some(edns) = &mut edns
-        {
-            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns)).build(
-                metadata,
-                &message.answers,
-                &message.authorities,
-                iter::empty::<&Record>(),
-                &message.additionals,
-            );
-            let mut measurement_bytes = Vec::with_capacity(512);
-            let mut measurement_encoder =
-                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-            let _ = measurement.destructive_emit(&mut measurement_encoder);
-            let pad_len = padding_len(state, measurement_bytes.len());
-            edns.options_mut().insert(EdnsOption::Unknown(
-                EdnsCode::Padding.into(),
-                vec![0; pad_len],
-            ));
-        }
-
         let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
             metadata,
             &message.answers,
@@ -429,12 +428,11 @@ impl QueryService {
             iter::empty::<&Record>(),
             &message.additionals,
         );
-
         match response_handle.send_response(response).await {
             Ok(info) => {
                 self.record_response(
                     request,
-                    response_code,
+                    metadata.response_code,
                     state,
                     started,
                     metadata.authentic_data,
@@ -442,11 +440,7 @@ impl QueryService {
                 info
             }
             Err(error) => {
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    error = %error,
-                    "failed to send DNS response"
-                );
+                tracing::warn!(listener = %self.listener_name, %error, "failed to send DNS response");
                 drop_response(request)
             }
         }
@@ -455,7 +449,7 @@ impl QueryService {
     async fn send_negative<R: ResponseHandler>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
         negative: NegativeResponse,
         state: &ListenerQueryState,
         validating: bool,
@@ -473,53 +467,15 @@ impl QueryService {
         metadata.response_code = response_code;
         metadata.authentic_data = authentic_data;
 
-        let mut edns = response_edns(request, state, self.protocol, None);
-        if let Some(edns) = &mut edns {
-            edns.options_mut().remove(EdnsCode::Padding);
-        }
-        if padding_requested(request, state)
-            && let Some(edns) = &mut edns
-        {
-            let measurement = MessageResponseBuilder::new(&request.queries, Some(edns)).build(
-                metadata,
-                iter::empty::<&Record>(),
-                authorities.iter(),
-                soa.iter(),
-                iter::empty::<&Record>(),
-            );
-            let mut measurement_bytes = Vec::with_capacity(512);
-            let mut measurement_encoder =
-                hickory_server::proto::serialize::binary::BinEncoder::new(&mut measurement_bytes);
-            let _ = measurement.destructive_emit(&mut measurement_encoder);
-            let pad_len = padding_len(state, measurement_bytes.len());
-            edns.options_mut().insert(EdnsOption::Unknown(
-                EdnsCode::Padding.into(),
-                vec![0; pad_len],
-            ));
-        }
-
-        let response = MessageResponseBuilder::new(&request.queries, edns.as_ref()).build(
-            metadata,
-            iter::empty::<&Record>(),
-            authorities.iter(),
-            soa.iter(),
-            iter::empty::<&Record>(),
+        let mut message = hickory_server::proto::op::Message::response(
+            request.metadata.id,
+            request.metadata.op_code,
         );
-
-        match response_handle.send_response(response).await {
-            Ok(info) => {
-                self.record_response(request, response_code, state, started, authentic_data);
-                info
-            }
-            Err(error) => {
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    error = %error,
-                    "failed to send DNS response"
-                );
-                drop_response(request)
-            }
-        }
+        message.metadata = metadata;
+        message.authorities = authorities;
+        message.authorities.extend(soa);
+        self.send_response(request, response_handle, message, None, state, started)
+            .await
     }
 
     pub async fn handle_malformed<R: ResponseHandler>(
@@ -587,6 +543,7 @@ impl QueryService {
                     self.stats.record_servfail();
                 }
 
+                self.stats.record_latency(started.elapsed());
                 let elapsed_ms = started.elapsed().as_millis();
                 let query = queries.queries().first();
                 if state.query_names {
@@ -634,7 +591,7 @@ impl QueryService {
     async fn send_status_truncated<R: ResponseHandler>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
         response_code: ResponseCode,
         extended_error: Option<ExtendedDnsError>,
         state: &ListenerQueryState,
@@ -645,24 +602,20 @@ impl QueryService {
         metadata.response_code = response_code;
         metadata.truncation = true;
 
-        let edns = response_edns(request, state, self.protocol, extended_error);
-        let response =
-            MessageResponseBuilder::new(&request.queries, edns.as_ref()).build_no_records(metadata);
-
-        match response_handle.send_response(response).await {
-            Ok(info) => {
-                self.record_response(request, response_code, state, started, false);
-                info
-            }
-            Err(error) => {
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    error = %error,
-                    "failed to send DNS response"
-                );
-                drop_response(request)
-            }
-        }
+        let mut message = hickory_server::proto::op::Message::response(
+            request.metadata.id,
+            request.metadata.op_code,
+        );
+        message.metadata = metadata;
+        self.send_response(
+            request,
+            response_handle,
+            message,
+            extended_error,
+            state,
+            started,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -688,6 +641,7 @@ impl QueryService {
         {
             Ok(Ok(response)) => response,
             _ => {
+                self.stats.record_upstream_failure();
                 return self
                     .send_status(
                         request,
@@ -815,6 +769,7 @@ impl QueryService {
             self.stats.record_servfail();
         }
 
+        self.stats.record_latency(started.elapsed());
         let elapsed_ms = started.elapsed().as_millis();
         if state.query_names {
             let query = request.queries.queries().first();
@@ -1089,6 +1044,7 @@ impl QueryService {
                     self.stats.record_cache_hit(1);
                 }
                 let extended_error = if resolved.stale {
+                    self.stats.record_upstream_failure();
                     Some(ExtendedDnsError::StaleAnswer)
                 } else {
                     None
@@ -1116,6 +1072,7 @@ impl QueryService {
                 .await
             }
             Err(_) => {
+                self.stats.record_upstream_failure();
                 tracing::warn!(
                     listener = %self.listener_name,
                     timeout_ms = state.query_timeout.as_millis(),
@@ -1173,6 +1130,7 @@ impl QueryService {
                 .await;
         }
 
+        self.stats.record_upstream_failure();
         tracing::warn!(
             listener = %self.listener_name,
             error = %error,

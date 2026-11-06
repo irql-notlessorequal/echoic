@@ -93,6 +93,11 @@ impl RecursiveResolver for MockResolver {
                 false,
                 None,
             ))),
+            "slow.example." => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                response.add_answer(a_record(&name, [192, 0, 2, 10], Proof::Indeterminate));
+                Ok(response)
+            }
             "fail.example." => Err(RecursorError::Message("mock failure")),
             "bogus.example." => {
                 response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Bogus));
@@ -2133,5 +2138,83 @@ address = "127.0.0.1:0"
         vec![0, 17, b'F', b'i', b'l', b't', b'e', b'r', b'e', b'd']
     );
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_connection_limit_preserves_existing_connections() {
+    let config = config_for(Protocol::Tcp, "limits = { max_connections = 1 }");
+    let server = start_config(&config, false, 16).await;
+    let mut first = TcpStream::connect(server.runtime.bound_address)
+        .await
+        .unwrap();
+    let bytes = query("www.example.", RecordType::A).to_vec().unwrap();
+    first.write_u16(bytes.len() as u16).await.unwrap();
+    first.write_all(&bytes).await.unwrap();
+    let length = first.read_u16().await.unwrap();
+    let mut response = vec![0; usize::from(length)];
+    first.read_exact(&mut response).await.unwrap();
+    let mut second = TcpStream::connect(server.runtime.bound_address)
+        .await
+        .unwrap();
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(1), second.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    first.write_u16(bytes.len() as u16).await.unwrap();
+    first.write_all(&bytes).await.unwrap();
+    assert!(first.read_u16().await.unwrap() > 0);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_idle_timeout_uses_listener_state() {
+    let mut config = config_for(Protocol::Tcp, "");
+    config.server_limits.idle_timeout = Duration::from_millis(100);
+    let server = start_config(&config, false, 16).await;
+    let mut stream = TcpStream::connect(server.runtime.bound_address)
+        .await
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn tcp_partial_frame_survives_another_query_completing() {
+    let server = start(Protocol::Tcp, false).await;
+    let mut stream = TcpStream::connect(server.runtime.bound_address)
+        .await
+        .unwrap();
+    let first = query("slow.example.", RecordType::A).to_vec().unwrap();
+    let second = query("www.example.", RecordType::A).to_vec().unwrap();
+    stream.write_u16(first.len() as u16).await.unwrap();
+    stream.write_all(&first).await.unwrap();
+    stream.write_u16(second.len() as u16).await.unwrap();
+    let split = second.len() / 2;
+    stream.write_all(&second[..split]).await.unwrap();
+    let length = stream.read_u16().await.unwrap();
+    let mut response = vec![0; usize::from(length)];
+    stream.read_exact(&mut response).await.unwrap();
+    stream.write_all(&second[split..]).await.unwrap();
+    let length = tokio::time::timeout(Duration::from_secs(1), stream.read_u16())
+        .await
+        .unwrap()
+        .unwrap();
+    response.resize(usize::from(length), 0);
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(
+        Message::from_vec(&response).unwrap().queries[0]
+            .name()
+            .to_string(),
+        "www.example."
+    );
     server.stop().await;
 }

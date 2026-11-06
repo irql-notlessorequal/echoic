@@ -42,6 +42,9 @@ impl RecursiveResolver for MockResolver {
         query: hickory_server::proto::op::Query,
         _dnssec_ok: bool,
     ) -> Result<Message, RecursorError> {
+        if query.name().to_string() == "slow.example." {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let mut response = Message::response(0, hickory_server::proto::op::OpCode::Query);
         response.add_query(query.clone());
         response.add_answer(hickory_server::proto::rr::Record::from_rdata(
@@ -193,6 +196,50 @@ async fn dot_resolves() {
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert_eq!(response.answers.len(), 1);
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn dot_pipelines_queries_and_drains_responses_on_shutdown() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server = start().await;
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"dot".to_vec()];
+    let connector = TlsConnector::from(Arc::new(config));
+    let tcp = TcpStream::connect(server.runtime.bound_address)
+        .await
+        .unwrap();
+    let mut stream = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    for (id, name) in [(1, "slow.example."), (2, "fast.example.")] {
+        let mut message = Message::query();
+        message.metadata.id = id;
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        let bytes = message.to_vec().unwrap();
+        frames.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        frames.extend_from_slice(&bytes);
+    }
+    stream.write_all(&frames).await.unwrap();
+    stream.flush().await.unwrap();
+    let length = stream.read_u16().await.unwrap();
+    let mut response = vec![0; usize::from(length)];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(Message::from_vec(&response).unwrap().metadata.id, 2);
+    server.runtime.token.cancel();
+    let length = stream.read_u16().await.unwrap();
+    response.resize(usize::from(length), 0);
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(Message::from_vec(&response).unwrap().metadata.id, 1);
     server.stop().await;
 }
 

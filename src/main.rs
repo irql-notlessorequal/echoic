@@ -36,6 +36,17 @@ fn run() -> anyhow::Result<()> {
     let config = Config::load(&cli.config)?;
 
     if cli.check_config {
+        if cli.check_files {
+            echoic::tls::install_crypto_provider();
+            echoic::recursor::build_recursor(&config)?;
+            echoic::rpz::RpzPolicy::load(
+                &config.blocklist.rpz_paths,
+                config.blocklist.rpz_origin.as_deref(),
+            )?;
+            for tls in &config.tls {
+                echoic::tls::TlsState::load(&tls.cert, &tls.key, echoic::config::Protocol::Dot)?;
+            }
+        }
         println!("configuration OK");
         return Ok(());
     }

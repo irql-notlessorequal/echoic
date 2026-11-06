@@ -38,4 +38,10 @@ pub struct Cli {
         help = "Validate the configuration file and exit without starting listeners"
     )]
     pub check_config: bool,
+    #[arg(
+        long,
+        requires = "check_config",
+        help = "Also load certificates, root hints, trust anchors and RPZ files"
+    )]
+    pub check_files: bool,
 }

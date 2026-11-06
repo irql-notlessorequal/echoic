@@ -127,6 +127,9 @@ impl Config {
         if let Some(path) = &mut self.dnssec.trust_anchor {
             *path = resolve_path(base, path);
         }
+        if let Some(path) = &mut self.cache.path {
+            *path = resolve_path(base, path);
+        }
         for path in &mut self.blocklist.rpz_paths {
             *path = resolve_path(base, path);
         }
@@ -598,7 +601,7 @@ impl AclConfig {
             return false;
         }
         if self.allow.is_empty() {
-            if self.deny.is_empty() && !protocol.is_encrypted() {
+            if !protocol.is_encrypted() {
                 return private_networks()
                     .iter()
                     .any(|network| network.contains(&address));
@@ -1020,6 +1023,34 @@ address = "127.0.0.1:5353"
         Config::from_toml_str(config)
             .expect_err("configuration should be rejected")
             .to_string()
+    }
+
+    #[test]
+    fn deny_only_acl_keeps_private_allow_defaults() {
+        let acl = AclConfig {
+            allow: Vec::new(),
+            deny: vec!["192.168.1.1/32".parse().unwrap()],
+        };
+        for protocol in [Protocol::Udp, Protocol::Tcp] {
+            assert!(!acl.is_allowed("8.8.8.8".parse().unwrap(), protocol));
+            assert!(!acl.is_allowed("::ffff:8.8.8.8".parse().unwrap(), protocol));
+            assert!(!acl.is_allowed("192.168.1.1".parse().unwrap(), protocol));
+            assert!(acl.is_allowed("192.168.1.2".parse().unwrap(), protocol));
+        }
+        assert!(acl.is_allowed("8.8.8.8".parse().unwrap(), Protocol::Doh));
+    }
+
+    #[test]
+    fn cache_path_is_resolved_against_config_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("echoic.toml");
+        fs::write(
+            &path,
+            format!("[cache]\npersistent = true\npath = 'cache.json'\n{MINIMAL_CONFIG}"),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.cache.path, Some(directory.path().join("cache.json")));
     }
 
     #[test]

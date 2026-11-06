@@ -20,15 +20,16 @@ use arc_swap::ArcSwap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use futures_util::stream::StreamExt;
 use hickory_net::runtime::TokioTime;
-use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
-use hickory_net::tls::tls_from_stream;
+use hickory_server::net::NetError;
 use hickory_server::net::xfer::Protocol as HickoryProtocol;
 use hickory_server::proto::op::Header;
+use hickory_server::proto::rr::Record;
 use hickory_server::proto::serialize::binary::{BinDecodable, BinDecoder};
-use hickory_server::server::{Request, RequestHandler, ResponseHandle};
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
+use hickory_server::zone_handler::MessageResponse;
 use hickory_server::zone_handler::Queries;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -40,6 +41,8 @@ use crate::net::apply_dscp;
 use crate::query::QueryService;
 use crate::tls::TlsState;
 
+const MAX_CONNECTION_QUERIES: usize = 32;
+const RESPONSE_QUEUE_CAPACITY: usize = MAX_CONNECTION_QUERIES;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub async fn start_dot_listener(
@@ -47,17 +50,29 @@ pub async fn start_dot_listener(
     service: QueryService,
     tls_state: Arc<TlsState>,
 ) -> Result<ListenerRuntime> {
+    anyhow::ensure!(
+        listener.protocol == Protocol::Dot,
+        "DoT listener requires dot protocol"
+    );
+    start_stream_listener(listener, service, Some(tls_state)).await
+}
+
+pub(crate) async fn start_stream_listener(
+    listener: &ListenerConfig,
+    service: QueryService,
+    tls_state: Option<Arc<TlsState>>,
+) -> Result<ListenerRuntime> {
     let max_connections = listener
         .limits
         .effective(listener.protocol)
         .max_connections
-        .unwrap_or(512) as usize;
+        .expect("stream connection limit") as usize;
 
     let query_state = service.state();
     let max_connections_state = Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(
         max_connections,
     ))));
-    let tls_state_swap = Arc::new(ArcSwap::from_pointee(Some(tls_state.clone())));
+    let tls_state_swap = Arc::new(ArcSwap::from_pointee(tls_state.clone()));
     let service = Arc::new(service);
 
     let socket = TcpListener::bind(listener.address).await.with_context(|| {
@@ -76,7 +91,7 @@ pub async fn start_dot_listener(
 
     tracing::info!(
         listener = %listener.name,
-        protocol = "dot",
+        protocol = listener.protocol.as_str(),
         address = %bound_address,
         "listener started"
     );
@@ -88,6 +103,7 @@ pub async fn start_dot_listener(
     let max_connections_for_task = max_connections_state.clone();
     let listener_name = listener.name.clone();
     let listener_dscp = listener.dscp;
+    let protocol = listener.protocol;
 
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
@@ -99,7 +115,7 @@ pub async fn start_dot_listener(
                     let (tcp_stream, src_addr) = match accept {
                         Ok(result) => result,
                         Err(error) => {
-                            tracing::debug!(listener = %listener_name, error = %error, "error accepting DoT connection");
+                            tracing::debug!(listener = %listener_name, error = %error, "error accepting DNS stream connection");
                             tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                             continue;
                         }
@@ -109,7 +125,7 @@ pub async fn start_dot_listener(
                     let permit = match semaphore.as_ref().clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            tracing::debug!(listener = %listener_name, src = %src_addr, "DoT connection cap reached");
+                            tracing::debug!(listener = %listener_name, src = %src_addr, "DNS stream connection cap reached");
                             drop(tcp_stream);
                             continue;
                         }
@@ -125,22 +141,26 @@ pub async fn start_dot_listener(
                             src = %src_addr,
                             dscp,
                             error = %error,
-                            "failed to set DoT connection DSCP; disabling it for this listener"
+                            "failed to set DNS stream connection DSCP; disabling it for this listener"
                         );
                     }
 
                     let service = service_for_task.clone();
                     let tls_state = tls_state_for_task.load();
-                    let tls_state = tls_state.as_ref().clone().expect("tls state");
+                    let tls_state = tls_state.as_ref().clone();
                     let token = task_token.clone();
                     connections.spawn(async move {
                         let _permit = permit;
-                        handle_connection(tcp_stream, src_addr, service, tls_state, token).await;
+                        if let Some(tls_state) = tls_state {
+                            handle_connection(tcp_stream, src_addr, service, tls_state, token).await;
+                        } else {
+                            handle_dns_stream(tcp_stream, src_addr, service, token, HickoryProtocol::Tcp).await;
+                        }
                     });
                 }
                 result = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(error)) = result {
-                        tracing::debug!(listener = %listener_name, error = %error, "DoT connection task failed");
+                        tracing::debug!(listener = %listener_name, error = %error, "DNS stream connection task failed");
                     }
                 }
             }
@@ -153,7 +173,7 @@ pub async fn start_dot_listener(
 
     Ok(ListenerRuntime {
         name: listener.name.clone(),
-        protocol: Protocol::Dot,
+        protocol,
         address: listener.address,
         bound_address,
         token,
@@ -179,12 +199,14 @@ async fn handle_connection(
     tls_state: Arc<TlsState>,
     token: CancellationToken,
 ) {
-    let tls_stream = match tokio::time::timeout(
+    let handshake = tokio::time::timeout(
         service.query_timeout(),
         tls_state.acceptor().accept(tcp_stream),
-    )
-    .await
-    {
+    );
+    let tls_stream = match tokio::select! {
+        _ = token.cancelled() => return,
+        result = handshake => result,
+    } {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             tracing::debug!(src = %src_addr, error = %error, "DoT TLS handshake failed");
@@ -211,59 +233,117 @@ async fn handle_connection(
         }
     }
 
-    let (mut buf_stream, stream_handle) = tls_from_stream(AsyncIoTokioAsStd(tls_stream), src_addr);
+    handle_dns_stream(tls_stream, src_addr, service, token, HickoryProtocol::Tls).await;
+}
 
-    loop {
-        if token.is_cancelled() {
-            break;
+#[derive(Clone)]
+struct StreamResponseHandler {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl ResponseHandler for StreamResponseHandler {
+    async fn send_response<'a>(
+        &mut self,
+        response: MessageResponse<
+            '_,
+            'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+        >,
+    ) -> Result<ResponseInfo, NetError> {
+        let mut bytes = Vec::new();
+        let mut encoder = hickory_server::proto::serialize::binary::BinEncoder::new(&mut bytes);
+        encoder.set_max_size(u16::MAX);
+        let info = response.destructive_emit(&mut encoder)?;
+        self.sender.send(bytes).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "DNS connection closed")
+        })?;
+        Ok(info)
+    }
+}
+
+async fn handle_dns_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    src_addr: SocketAddr,
+    service: Arc<QueryService>,
+    token: CancellationToken,
+    protocol: HickoryProtocol,
+) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (sender, mut responses) = tokio::sync::mpsc::channel::<Vec<u8>>(RESPONSE_QUEUE_CAPACITY);
+    let response_handle = StreamResponseHandler { sender };
+    let writer_service = service.clone();
+    let mut writers = JoinSet::new();
+    writers.spawn(async move {
+        while let Some(bytes) = responses.recv().await {
+            let length = u16::try_from(bytes.len()).expect("encoded DNS message length");
+            let result = tokio::time::timeout(writer_service.query_timeout(), async {
+                writer.write_u16(length).await?;
+                writer.write_all(&bytes).await?;
+                writer.flush().await
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                return;
+            }
         }
-
-        let next = tokio::time::timeout(service.idle_timeout(), buf_stream.next()).await;
-        let message = match next {
-            Ok(Some(Ok(message))) => message,
-            Ok(Some(Err(error))) => {
-                tracing::debug!(src = %src_addr, error = %error, "DoT stream error");
-                break;
-            }
-            Ok(None) => break,
-            Err(_) => {
-                tracing::debug!(src = %src_addr, "DoT idle timeout");
-                break;
-            }
+        let _ = writer.shutdown().await;
+    });
+    let mut queries = JoinSet::new();
+    'connection: loop {
+        let read = async {
+            let length = reader.read_u16().await?;
+            let mut bytes = vec![0; usize::from(length)];
+            reader.read_exact(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
         };
-
-        let (message_bytes, message_src) = message.into_parts();
-        let started = std::time::Instant::now();
-
-        match Request::from_bytes(
-            message_bytes.to_vec(),
-            message_src,
-            hickory_server::net::xfer::Protocol::Tls,
-        ) {
-            Ok(request) => {
-                let response_handle =
-                    ResponseHandle::new(message_src, stream_handle.clone(), HickoryProtocol::Tls);
-                service
-                    .handle_request::<_, TokioTime>(&request, response_handle)
-                    .await;
-            }
-            Err(_) => {
-                let mut decoder = BinDecoder::new(&message_bytes);
-                if let Ok(header) = Header::read(&mut decoder) {
-                    let queries = Queries::read(&mut decoder, header.counts.queries as usize)
-                        .unwrap_or_else(|_| empty_queries());
-                    let response_handle = ResponseHandle::new(
-                        message_src,
-                        stream_handle.clone(),
-                        HickoryProtocol::Tls,
-                    );
-                    service
-                        .handle_malformed(message_src, header, queries, response_handle, started)
-                        .await;
-                } else {
-                    tracing::debug!(src = %src_addr, "DoT message too short to parse");
+        let read = tokio::time::timeout(service.idle_timeout(), read);
+        tokio::pin!(read);
+        let bytes = loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => break 'connection,
+                _ = writers.join_next(), if !writers.is_empty() => break 'connection,
+                result = queries.join_next(), if !queries.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!(%src_addr, %error, "DNS query task failed");
+                    }
+                }
+                result = &mut read, if queries.len() < MAX_CONNECTION_QUERIES => {
+                    match result {
+                        Ok(Ok(bytes)) => break bytes,
+                        _ => break 'connection,
+                    }
                 }
             }
-        }
+        };
+        let service = service.clone();
+        let response_handle = response_handle.clone();
+        queries.spawn(async move {
+            let started = std::time::Instant::now();
+            match Request::from_bytes(bytes.clone(), src_addr, protocol) {
+                Ok(request) => {
+                    service
+                        .handle_request::<_, TokioTime>(&request, response_handle)
+                        .await;
+                }
+                Err(_) => {
+                    let mut decoder = BinDecoder::new(&bytes);
+                    if let Ok(header) = Header::read(&mut decoder) {
+                        let queries = Queries::read(&mut decoder, header.counts.queries as usize)
+                            .unwrap_or_else(|_| empty_queries());
+                        service
+                            .handle_malformed(src_addr, header, queries, response_handle, started)
+                            .await;
+                    }
+                }
+            }
+        });
     }
+    while queries.join_next().await.is_some() {}
+    drop(response_handle);
+    while writers.join_next().await.is_some() {}
 }
