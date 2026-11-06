@@ -23,11 +23,13 @@ fn echoic() -> Command {
     Command::new(env!("CARGO_BIN_EXE_echoic"))
 }
 
+const TEST_DOH_LIMITS: &str = "{ max_connections = 8, max_concurrent_requests = 8 }";
+
 fn start_server() -> (Child, u16) {
-    start_server_with_listener("")
+    start_server_with_listener("", TEST_DOH_LIMITS)
 }
 
-fn start_server_with_listener(listener_extra: &str) -> (Child, u16) {
+fn start_server_with_listener(listener_extra: &str, limits: &str) -> (Child, u16) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
     let cert_path = dir.path().join("cert.pem");
@@ -57,7 +59,7 @@ protocol = "doh"
 address = "127.0.0.1:0"
 tls = "public"
 hostname = "localhost"
-limits = {{ max_connections = 8, max_concurrent_requests = 8 }}
+limits = {limits}
 {listener_extra}
 
 [server_limits]
@@ -134,7 +136,8 @@ fn stop(mut child: Child) {
 
 #[tokio::test]
 async fn static_routes_require_acl() {
-    let (child, port) = start_server_with_listener(r#"acl = { allow = ["192.0.2.0/24"] }"#);
+    let (child, port) =
+        start_server_with_listener(r#"acl = { allow = ["192.0.2.0/24"] }"#, TEST_DOH_LIMITS);
     let base = format!("https://localhost:{}", port);
 
     let mut cmd = Command::new("curl");
@@ -565,8 +568,10 @@ async fn landing_files_reload_without_a_signal() {
     let directory = tempfile::tempdir().unwrap();
     let html = directory.path().join("landing.html");
     std::fs::write(&html, "initial landing").unwrap();
-    let (child, port) =
-        start_server_with_listener(&format!("[landing_page]\nhtml = '{}'", html.display()));
+    let (child, port) = start_server_with_listener(
+        &format!("[landing_page]\nhtml = '{}'", html.display()),
+        TEST_DOH_LIMITS,
+    );
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .resolve(
@@ -594,9 +599,83 @@ async fn landing_files_reload_without_a_signal() {
     stop(child);
 }
 
-async fn raw_tls_exchange(port: u16, request: &[u8]) -> Vec<u8> {
+#[tokio::test]
+async fn doh_rate_limits_return_429_before_reading_a_post_body_and_allow_recovery() {
+    let (child, port) = start_server_with_listener(
+        "",
+        "{ qps = 1, burst = 1, max_connections = 8, max_concurrent_requests = 8 }",
+    );
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve(
+            "localhost",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("https://localhost:{port}/dns-query");
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let request = b"POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: 100\r\n\r\n";
+    let response = tokio::time::timeout(Duration::from_secs(1), raw_tls_exchange(port, request))
+        .await
+        .unwrap();
+    let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(response.starts_with("http/1.1 429"), "{response}");
+    assert!(response.contains("retry-after: 1\r\n"));
+    assert!(response.contains("cache-control: no-store\r\n"));
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    stop(child);
+}
+
+#[tokio::test]
+async fn doh_concurrency_exhaustion_returns_503() {
+    use tokio::io::AsyncWriteExt;
+    let (child, port) = start_server_with_listener(
+        "",
+        "{ qps=100, burst=100, max_connections=8, max_concurrent_requests=1 }",
+    );
+    let mut held = connect_tls(port).await;
+    held.write_all(b"POST /dns-query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/dns-message\r\nContent-Length: 100\r\n\r\nx").await.unwrap();
+    held.flush().await.unwrap();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve(
+            "localhost",
+            std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        )
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let response = client
+            .get(format!("https://localhost:{port}/dns-query"))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            assert!(response.headers().get("retry-after").is_none());
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(held);
+    stop(child);
+}
+
+async fn connect_tls(port: u16) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
 
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -610,7 +689,12 @@ async fn raw_tls_exchange(port: u16, request: &[u8]) -> Vec<u8> {
         .await
         .expect("tcp");
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
-    let mut tls = connector.connect(name, tcp).await.expect("tls");
+    connector.connect(name, tcp).await.expect("tls")
+}
+
+async fn raw_tls_exchange(port: u16, request: &[u8]) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tls = connect_tls(port).await;
     tls.write_all(request).await.expect("write request");
     let mut response = Vec::new();
     let mut chunk = [0_u8; 1024];

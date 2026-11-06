@@ -14,7 +14,7 @@ anyhow = "1.0"
 arc-swap = "1.9"
 axum = "0.8"
 base64 = "0.22"
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 governor = "0.10"
@@ -43,6 +43,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+tokio = { version = "1.48", features = ["test-util"] }
 libc = "0.2"
 tempfile = "3.14"
 rcgen = "0.13"

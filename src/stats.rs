@@ -33,6 +33,11 @@ pub struct Stats {
     latency_count: AtomicU64,
     latency_nanos: AtomicU64,
     upstream_failures: AtomicU64,
+    upstream_sent: AtomicU64,
+    upstream_rejected: AtomicU64,
+    upstream_pending: AtomicU64,
+    upstream_waits: AtomicU64,
+    upstream_wait_nanos: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,11 +106,43 @@ impl Stats {
         self.upstream_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_upstream_sent(&self) {
+        self.upstream_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_upstream_rejected(&self) {
+        self.upstream_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn upstream_pending(&self, added: bool) {
+        if added {
+            self.upstream_pending.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.upstream_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_upstream_wait(&self, elapsed: std::time::Duration) {
+        self.upstream_waits.fetch_add(1, Ordering::Relaxed);
+        self.upstream_wait_nanos.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn prometheus(&self, available_permits: usize) -> String {
         use std::fmt::Write;
         let snapshot = self.snapshot();
         let mut output = String::new();
         for (name, value) in [
+            (
+                "echoic_upstream_sent_total",
+                self.upstream_sent.load(Ordering::Relaxed),
+            ),
+            (
+                "echoic_upstream_pacing_rejected_total",
+                self.upstream_rejected.load(Ordering::Relaxed),
+            ),
             ("echoic_requests_total", snapshot.total),
             ("echoic_udp_requests_total", snapshot.udp),
             ("echoic_tcp_requests_total", snapshot.tcp),
@@ -125,6 +162,16 @@ impl Stats {
         ] {
             writeln!(output, "# TYPE {name} counter\n{name} {value}").unwrap();
         }
+        writeln!(
+            output,
+            "# TYPE echoic_upstream_pending gauge\nechoic_upstream_pending {}",
+            self.upstream_pending.load(Ordering::Relaxed)
+        )
+        .unwrap();
+        writeln!(output, "# TYPE echoic_upstream_wait_seconds summary\nechoic_upstream_wait_seconds_count {}\nechoic_upstream_wait_seconds_sum {}",
+            self.upstream_waits.load(Ordering::Relaxed),
+            self.upstream_wait_nanos.load(Ordering::Relaxed) as f64 / std::time::Duration::from_secs(1).as_nanos() as f64,
+        ).unwrap();
         writeln!(output, "# TYPE echoic_query_duration_seconds summary\nechoic_query_duration_seconds_count {}\nechoic_query_duration_seconds_sum {}",
             self.latency_count.load(Ordering::Relaxed),
             self.latency_nanos.load(Ordering::Relaxed) as f64 / std::time::Duration::from_secs(1).as_nanos() as f64,

@@ -74,3 +74,10 @@ shutdown_grace = "10s"
 [blocklist]
 # rpz_paths = ["/etc/echoic/block.rpz"]
 # rpz_origin = "rpz.local."
+
+# Optional upstream pacing; rates count DNS messages across all listeners.
+# [recursor.upstream_limits]
+# global = { qps = 2000, burst = 200 }
+# per_server = { qps = 200, burst = 20 }
+# max_pending = 128
+# max_wait = "200ms"

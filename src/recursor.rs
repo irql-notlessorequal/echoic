@@ -43,6 +43,10 @@ use tokio::net::{TcpSocket, TcpStream};
 
 use crate::config::{Config, QNameMinimization as ConfigQNameMinimization};
 use crate::net::apply_dscp;
+use crate::stats::Stats;
+use crate::upstream::{
+    PACING_EXHAUSTED, PacedProvider, PacedTcp, PacedUdp, RESOLUTION, Resolution, UpstreamPacer,
+};
 
 const EMBEDDED_ROOT_HINTS: &str = include_str!("../assets/root.hints");
 const EMBEDDED_ROOT_HINTS_NAME: &str = "assets/root.hints";
@@ -230,15 +234,17 @@ fn is_negative_recursor_error(error: &RecursorError) -> bool {
 }
 
 #[derive(Clone)]
-struct DscpRuntimeProvider {
+struct UpstreamRuntimeProvider {
+    pacer: Arc<UpstreamPacer>,
     inner: TokioRuntimeProvider,
-    dscp: u8,
+    dscp: Option<u8>,
     warned: Arc<AtomicBool>,
 }
 
-impl DscpRuntimeProvider {
-    fn new(dscp: u8) -> Self {
+impl UpstreamRuntimeProvider {
+    fn new(dscp: Option<u8>, pacer: Arc<UpstreamPacer>) -> Self {
         Self {
+            pacer,
             inner: TokioRuntimeProvider::new(),
             dscp,
             warned: Arc::new(AtomicBool::new(false)),
@@ -246,11 +252,11 @@ impl DscpRuntimeProvider {
     }
 }
 
-impl RuntimeProvider for DscpRuntimeProvider {
+impl RuntimeProvider for UpstreamRuntimeProvider {
     type Handle = TokioHandle;
     type Timer = TokioTime;
-    type Udp = tokio::net::UdpSocket;
-    type Tcp = AsyncIoTokioAsStd<TcpStream>;
+    type Udp = PacedUdp<tokio::net::UdpSocket>;
+    type Tcp = PacedTcp<AsyncIoTokioAsStd<TcpStream>>;
 
     fn create_handle(&self) -> Self::Handle {
         self.inner.create_handle()
@@ -264,6 +270,7 @@ impl RuntimeProvider for DscpRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         let dscp = self.dscp;
         let warned = self.warned.clone();
+        let pacer = self.pacer.clone();
         Box::pin(async move {
             let socket = match server_addr {
                 SocketAddr::V4(_) => TcpSocket::new_v4(),
@@ -275,7 +282,8 @@ impl RuntimeProvider for DscpRuntimeProvider {
             }
 
             socket.set_nodelay(true)?;
-            if let Err(error) = apply_dscp(&socket, server_addr, dscp)
+            if let Some(dscp) = dscp
+                && let Err(error) = apply_dscp(&socket, server_addr, dscp)
                 && !warned.swap(true, Ordering::Relaxed)
             {
                 tracing::warn!(
@@ -288,7 +296,11 @@ impl RuntimeProvider for DscpRuntimeProvider {
 
             let wait_for = wait_for.unwrap_or(UPSTREAM_CONNECT_TIMEOUT);
             match tokio::time::timeout(wait_for, socket.connect(server_addr)).await {
-                Ok(Ok(socket)) => Ok(AsyncIoTokioAsStd(socket)),
+                Ok(Ok(socket)) => Ok(PacedTcp::new(
+                    AsyncIoTokioAsStd(socket),
+                    pacer,
+                    server_addr.ip(),
+                )),
                 Ok(Err(error)) => Err(error),
                 Err(_) => {
                     tracing::debug!(%server_addr, "TCP connect timeout");
@@ -308,9 +320,11 @@ impl RuntimeProvider for DscpRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         let dscp = self.dscp;
         let warned = self.warned.clone();
+        let pacer = self.pacer.clone();
         Box::pin(async move {
             let socket = tokio::net::UdpSocket::bind(local_addr).await?;
-            if let Err(error) = apply_dscp(&socket, local_addr, dscp)
+            if let Some(dscp) = dscp
+                && let Err(error) = apply_dscp(&socket, local_addr, dscp)
                 && !warned.swap(true, Ordering::Relaxed)
             {
                 tracing::warn!(
@@ -320,22 +334,93 @@ impl RuntimeProvider for DscpRuntimeProvider {
                     "failed to set upstream DSCP; continuing without it"
                 );
             }
-            Ok(socket)
+            Ok(PacedUdp::new(socket, pacer))
         })
     }
 }
 
 pub fn build_recursor(config: &Config) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
-    match config.recursor.dscp {
-        Some(dscp) => build_recursor_with_provider(config, DscpRuntimeProvider::new(dscp)),
-        None => build_recursor_with_provider(config, TokioRuntimeProvider::new()),
-    }
+    let pacer = UpstreamPacer::new(
+        config.recursor.upstream_limits.clone(),
+        Arc::new(Stats::default()),
+    );
+    build_recursor_with_pacer(config, pacer)
+}
+
+pub(crate) fn build_recursor_with_pacer(
+    config: &Config,
+    pacer: Arc<UpstreamPacer>,
+) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
+    let runtime = UpstreamRuntimeProvider::new(config.recursor.dscp, pacer.clone());
+    build_with_provider(
+        config,
+        PacedProvider {
+            inner: runtime,
+            pacer,
+            gate_requests: false,
+        },
+    )
 }
 
 pub fn build_recursor_with_provider<P: ConnectionProvider>(
     config: &Config,
     provider: P,
 ) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
+    let pacer = UpstreamPacer::new(
+        config.recursor.upstream_limits.clone(),
+        Arc::new(Stats::default()),
+    );
+    build_with_provider(
+        config,
+        PacedProvider {
+            inner: provider,
+            pacer,
+            gate_requests: true,
+        },
+    )
+}
+
+struct PacedResolver<P: ConnectionProvider> {
+    inner: Recursor<P>,
+    pacer: Arc<UpstreamPacer>,
+}
+
+#[async_trait]
+impl<P: ConnectionProvider> RecursiveResolver for PacedResolver<P> {
+    async fn resolve(&self, query: Query, dnssec_ok: bool) -> Result<Message, RecursorError> {
+        let context = Resolution::new();
+        let _finished = context.finished.clone().drop_guard();
+        let result = RESOLUTION.scope(context.clone(), async {
+            tokio::select! {
+                biased;
+                _ = context.rejected.cancelled() => Err(RecursorError::Message(PACING_EXHAUSTED)),
+                result = self.inner.resolve(query, Instant::now(), dnssec_ok) => result,
+            }
+        }).await;
+        let result = if context.rejected.is_cancelled() {
+            Err(RecursorError::Message(PACING_EXHAUSTED))
+        } else {
+            result
+        };
+        if result.as_ref().is_err_and(|error| {
+            !is_negative_recursor_error(error)
+                && !matches!(error, RecursorError::Message(PACING_EXHAUSTED))
+        }) {
+            self.pacer.stats.record_upstream_failure();
+        }
+        result
+    }
+
+    fn is_validating(&self) -> bool {
+        self.inner.is_validating()
+    }
+}
+
+fn build_with_provider<P: ConnectionProvider>(
+    config: &Config,
+    provider: PacedProvider<P>,
+) -> anyhow::Result<Arc<dyn RecursiveResolver>> {
+    let pacer = provider.pacer.clone();
     let roots = load_roots(&config.recursor)?;
     let mut options = RecursorOptions {
         ns_cache_size: config.recursor.ns_cache_size,
@@ -386,7 +471,10 @@ pub fn build_recursor_with_provider<P: ConnectionProvider>(
         bail!("recursor was configured without DNSSEC validation");
     }
 
-    Ok(Arc::new(recursor))
+    Ok(Arc::new(PacedResolver {
+        inner: recursor,
+        pacer,
+    }))
 }
 
 fn load_roots(config: &crate::config::RecursorConfig) -> anyhow::Result<Vec<IpAddr>> {
@@ -471,6 +559,219 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct PortProvider {
+        runtime: UpstreamRuntimeProvider,
+        port: u16,
+    }
+
+    impl ConnectionProvider for PortProvider {
+        type Conn = <UpstreamRuntimeProvider as ConnectionProvider>::Conn;
+        type FutureConn = <UpstreamRuntimeProvider as ConnectionProvider>::FutureConn;
+        type RuntimeProvider = UpstreamRuntimeProvider;
+
+        fn new_connection(
+            &self,
+            ip: IpAddr,
+            config: &hickory_server::resolver::config::ConnectionConfig,
+            cx: &hickory_server::resolver::PoolContext,
+        ) -> Result<Self::FutureConn, NetError> {
+            let mut config = config.clone();
+            config.port = self.port;
+            self.runtime.new_connection(ip, &config, cx)
+        }
+        fn runtime_provider(&self) -> &Self::RuntimeProvider {
+            &self.runtime
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_pacing_counts_tcp_fallback_and_recovers_without_caching_local_failures() {
+        use crate::config::{UpstreamLimits, UpstreamQuota};
+        use hickory_server::proto::op::OpCode;
+        use hickory_server::proto::rr::{
+            Record, RecordType,
+            rdata::{A, NS},
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::tls::install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let udp_count = Arc::new(AtomicU64::new(0));
+        let tcp_count = Arc::new(AtomicU64::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn({
+            let count = udp_count.clone();
+            async move {
+                let mut buffer = vec![0; u16::MAX as usize];
+                loop {
+                    let (size, source) = socket.recv_from(&mut buffer).await.unwrap();
+                    let request = Message::from_vec(&buffer[..size]).unwrap();
+                    count.fetch_add(1, Ordering::Relaxed);
+                    let mut response = Message::response(request.metadata.id, OpCode::Query);
+                    response.queries = request.queries;
+                    response.metadata.truncation = true;
+                    socket
+                        .send_to(&response.to_vec().unwrap(), source)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        tasks.spawn({
+            let count = tcp_count.clone();
+            async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut stream, _) = accepted.unwrap();
+                            let count = count.clone();
+                            connections.spawn(async move {
+                                while let Ok(length) = stream.read_u16().await {
+                                    let mut bytes = vec![0; usize::from(length)];
+                                    stream.read_exact(&mut bytes).await.unwrap();
+                                    let request = Message::from_vec(&bytes).unwrap();
+                                    count.fetch_add(1, Ordering::Relaxed);
+                                    let query = request.queries[0].clone();
+                                    let mut response = Message::response(request.metadata.id, OpCode::Query);
+                                    response.add_query(query.clone());
+                                    response.metadata.authoritative = true;
+                                    if query.query_type() == RecordType::NS {
+                                        let server = Name::from_ascii("ns.example.").unwrap();
+                                        response.add_answer(Record::from_rdata(query.name().clone(), 60, RData::NS(NS(server.clone()))));
+                                        response.add_additional(Record::from_rdata(server, 60, RData::A(A::new(127,0,0,1))));
+                                    } else {
+                                        response.add_answer(Record::from_rdata(query.name().clone(), 60, RData::A(A::new(192,0,2,10))));
+                                    }
+                                    let bytes = response.to_vec().unwrap();
+                                    stream.write_u16(bytes.len() as u16).await.unwrap();
+                                    stream.write_all(&bytes).await.unwrap();
+                                }
+                            });
+                        }
+                        _ = connections.join_next(), if !connections.is_empty() => {}
+                    }
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let hints = directory.path().join("root.hints");
+        fs::write(&hints, ". 60 NS ns.example.\nns.example. 60 A 127.0.0.1\n").unwrap();
+        let mut config = Config::from_toml_str("[dnssec]\nenabled=false\n[[listeners]]\nname='test'\nprotocol='udp'\naddress='127.0.0.1:0'").unwrap();
+        config.recursor.root_hints = Some(hints);
+        config.recursor.deny_server = Some(Vec::new());
+        let quota = UpstreamLimits {
+            global: UpstreamQuota { qps: 20, burst: 1 },
+            per_server: UpstreamQuota { qps: 20, burst: 1 },
+            max_pending: 8,
+            max_wait: Duration::from_secs(1),
+        };
+        let stats = Arc::new(Stats::default());
+        let pacer = UpstreamPacer::new(Some(quota.clone()), stats.clone());
+        let provider = PortProvider {
+            runtime: UpstreamRuntimeProvider::new(None, pacer.clone()),
+            port: address.port(),
+        };
+        let resolver = build_with_provider(
+            &config,
+            PacedProvider {
+                inner: provider,
+                pacer: pacer.clone(),
+                gate_requests: false,
+            },
+        )
+        .unwrap();
+        let query = Query::query(Name::from_ascii("example.").unwrap(), RecordType::A);
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            resolver.resolve(query.clone(), false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!response.answers.is_empty());
+        let sent = udp_count.load(Ordering::Relaxed) + tcp_count.load(Ordering::Relaxed);
+        assert!(tcp_count.load(Ordering::Relaxed) > 0);
+        assert!(
+            stats
+                .prometheus(0)
+                .contains(&format!("echoic_upstream_sent_total {sent}\n"))
+        );
+        resolver.resolve(query, false).await.unwrap();
+        assert_eq!(
+            sent,
+            udp_count.load(Ordering::Relaxed) + tcp_count.load(Ordering::Relaxed)
+        );
+        let mut tight = quota;
+        tight.max_wait = Duration::ZERO;
+        tight.global.qps = 1;
+        tight.per_server.qps = 1;
+        pacer.reconfigure(Some(tight));
+        let uncached = Query::query(Name::from_ascii("other.example.").unwrap(), RecordType::A);
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolver.resolve(uncached.clone(), false),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(error, RecursorError::Message(PACING_EXHAUSTED)),
+            "{error:?}"
+        );
+        let cache_config = crate::config::CacheConfig {
+            max_ttl: Duration::from_secs(1),
+            serve_stale: true,
+            stale_ttl: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let cache = Arc::new(crate::persistent_cache::PersistentDnsCache::new(
+            &cache_config,
+        ));
+        let mut saved = Message::response(0, OpCode::Query);
+        saved.add_answer(Record::from_rdata(
+            uncached.name().clone(),
+            1,
+            RData::A(A::new(192, 0, 2, 99)),
+        ));
+        cache.insert(
+            crate::persistent_cache::CacheKey {
+                name: uncached.name().clone(),
+                qtype: uncached.query_type(),
+                qclass: uncached.query_class(),
+                dnssec_ok: false,
+            },
+            saved,
+            std::time::SystemTime::now() - Duration::from_secs(2),
+        );
+        let cached = CachedRecursiveResolver::new(
+            resolver.clone(),
+            Arc::new(ArcSwap::from_pointee(Some(cache))),
+        );
+        let stale = cached
+            .resolve_cached(uncached.clone(), false)
+            .await
+            .unwrap();
+        assert!(stale.stale);
+        assert!(stale.cache_hit);
+        assert_eq!(stale.message.answers[0].ttl, 0);
+        pacer.reconfigure(None);
+        let response =
+            tokio::time::timeout(Duration::from_secs(3), resolver.resolve(uncached, false))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!response.answers.is_empty());
+        assert!(
+            stats
+                .prometheus(0)
+                .contains("echoic_upstream_failures_total 0\n")
+        );
+    }
+
     #[test]
     fn embedded_root_hints_contain_addresses() {
         let addresses = load_roots(&RecursorConfig::default()).expect("root hints parse");
@@ -482,7 +783,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn dscp_provider_applies_udp_socket_class() {
-        let provider = DscpRuntimeProvider::new(45);
+        let provider = UpstreamRuntimeProvider::new(
+            Some(45),
+            UpstreamPacer::new(None, Arc::new(Stats::default())),
+        );
         let udp = provider
             .bind_udp(
                 "127.0.0.1:0".parse().unwrap(),
@@ -491,7 +795,9 @@ mod tests {
             .await
             .expect("bind udp");
         assert_eq!(
-            socket2::SockRef::from(&udp).tos_v4().expect("read tos"),
+            socket2::SockRef::from(&udp.inner)
+                .tos_v4()
+                .expect("read tos"),
             180
         );
         drop(udp);
@@ -509,14 +815,17 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             drop(stream);
         });
-        let provider = DscpRuntimeProvider::new(45);
+        let provider = UpstreamRuntimeProvider::new(
+            Some(45),
+            UpstreamPacer::new(None, Arc::new(Stats::default())),
+        );
         let result = provider
             .connect_tcp(addr, None, Some(Duration::from_secs(2)))
             .await;
         assert!(result.is_ok(), "connect failed");
         let stream = result.unwrap();
         assert_eq!(
-            socket2::SockRef::from(&stream.0)
+            socket2::SockRef::from(&stream.inner.0)
                 .tos_v4()
                 .expect("read tos"),
             180

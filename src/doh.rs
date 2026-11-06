@@ -375,6 +375,22 @@ async fn doh_guard(
     next.run(request).await
 }
 
+fn rate_limited_response(retry_after: Duration) -> Response {
+    let seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() != 0))
+        .max(1);
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_str(&seconds.to_string()).expect("retry seconds"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 async fn dns_query(
     State(state): State<DohState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -389,19 +405,20 @@ async fn dns_query(
     let query_state = state.service.snapshot();
     let inflight = state.service.inflight();
 
-    let inflight_permit = match state.service.admit_with(peer.ip(), &query_state, inflight) {
+    let inflight_permit = match state
+        .service
+        .admit_with_retry(peer.ip(), &query_state, inflight)
+    {
         Ok(permit) => permit,
-        Err(AdmissionError::AclDenied) => return StatusCode::FORBIDDEN.into_response(),
-        Err(AdmissionError::RateLimited) => {
-            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            return response;
-        }
-        Err(AdmissionError::Overloaded) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+        Err(rejection) => match rejection.reason {
+            AdmissionError::AclDenied => return StatusCode::FORBIDDEN.into_response(),
+            AdmissionError::RateLimited => {
+                return rate_limited_response(
+                    rejection.retry_after.expect("rate limit retry time"),
+                );
+            }
+            AdmissionError::Overloaded => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
     };
     let doh_permit = match concurrency.try_acquire_owned() {
         Ok(permit) => permit,
@@ -860,6 +877,22 @@ mod tests {
             }
             Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
             Err(error) => panic!("set option: {error}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_response_rounds_retry_time_up_and_disables_caching() {
+        for (wait, seconds) in [
+            (Duration::ZERO, "1"),
+            (Duration::from_nanos(1), "1"),
+            (Duration::from_secs(1), "1"),
+            (Duration::from_secs(1) + Duration::from_nanos(1), "2"),
+            (Duration::from_secs(65), "65"),
+        ] {
+            let response = rate_limited_response(wait);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], seconds);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         }
     }
 

@@ -21,6 +21,7 @@ use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use governor::clock::Clock;
 use hickory_server::net::runtime::Time;
 use hickory_server::net::{DnsError, NetError};
 use hickory_server::proto::op::{
@@ -89,6 +90,12 @@ pub enum AdmissionError {
     AclDenied,
     RateLimited,
     Overloaded,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionRejection {
+    pub reason: AdmissionError,
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -238,26 +245,38 @@ impl QueryService {
         state: &ListenerQueryState,
         inflight: Arc<Semaphore>,
     ) -> Result<OwnedSemaphorePermit, AdmissionError> {
+        self.admit_with_retry(source, state, inflight)
+            .map_err(|rejection| rejection.reason)
+    }
+
+    pub(crate) fn admit_with_retry(
+        &self,
+        source: IpAddr,
+        state: &ListenerQueryState,
+        inflight: Arc<Semaphore>,
+    ) -> Result<OwnedSemaphorePermit, AdmissionRejection> {
         let source = normalize_ip(source);
         if !state.acl.is_allowed(source, self.protocol) {
             self.stats.record_acl_denied();
-            return Err(AdmissionError::AclDenied);
+            return Err(AdmissionRejection {
+                reason: AdmissionError::AclDenied,
+                retry_after: None,
+            });
         }
-        if state
-            .rate_limiter
-            .check_key(&RateKey::from(source))
-            .is_err()
-        {
+        if let Err(until) = state.rate_limiter.check_key(&RateKey::from(source)) {
             self.stats.record_rate_limited();
-            return Err(AdmissionError::RateLimited);
+            return Err(AdmissionRejection {
+                reason: AdmissionError::RateLimited,
+                retry_after: Some(until.wait_time_from(state.rate_limiter.clock().now())),
+            });
         }
-        match inflight.try_acquire_owned() {
-            Ok(permit) => Ok(permit),
-            Err(_) => {
-                self.stats.record_overloaded();
-                Err(AdmissionError::Overloaded)
+        inflight.try_acquire_owned().map_err(|_| {
+            self.stats.record_overloaded();
+            AdmissionRejection {
+                reason: AdmissionError::Overloaded,
+                retry_after: None,
             }
-        }
+        })
     }
 
     async fn reject<R: ResponseHandler>(
@@ -641,7 +660,6 @@ impl QueryService {
         {
             Ok(Ok(response)) => response,
             _ => {
-                self.stats.record_upstream_failure();
                 return self
                     .send_status(
                         request,
@@ -1044,7 +1062,6 @@ impl QueryService {
                     self.stats.record_cache_hit(1);
                 }
                 let extended_error = if resolved.stale {
-                    self.stats.record_upstream_failure();
                     Some(ExtendedDnsError::StaleAnswer)
                 } else {
                     None
@@ -1130,7 +1147,21 @@ impl QueryService {
                 .await;
         }
 
-        self.stats.record_upstream_failure();
+        if matches!(
+            error,
+            RecursorError::Message(crate::upstream::PACING_EXHAUSTED)
+        ) {
+            return self
+                .send_status(
+                    request,
+                    response_handle,
+                    ResponseCode::ServFail,
+                    None,
+                    state,
+                    started,
+                )
+                .await;
+        }
         tracing::warn!(
             listener = %self.listener_name,
             error = %error,

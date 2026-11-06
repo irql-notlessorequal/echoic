@@ -773,3 +773,62 @@ address = "127.0.0.1:0"
     let resolver = build_recursor(&config).expect("build DNSSEC recursor");
     assert!(!resolver.is_validating());
 }
+
+#[tokio::test]
+async fn dnssec_lookups_observe_upstream_pacing_and_retain_validation() {
+    use echoic::config::{UpstreamLimits, UpstreamQuota};
+    let directory = tempfile::tempdir().unwrap();
+    let root_hints = directory.path().join("root.hints");
+    std::fs::write(
+        &root_hints,
+        format!(". 3600 NS a.root-servers.test.\na.root-servers.test. 3600 A {ROOT_IP}\n"),
+    )
+    .unwrap();
+    let (provider, root_key) = signed_hierarchy(DsResponseMode::Normal);
+    let trust_anchor = directory.path().join("root.key");
+    std::fs::write(&trust_anchor, format!(". 3600 IN DNSKEY {root_key}\n")).unwrap();
+    let mut config = config(&root_hints, &trust_anchor, true);
+    config.recursor.upstream_limits = Some(UpstreamLimits {
+        global: UpstreamQuota { qps: 1, burst: 1 },
+        per_server: UpstreamQuota { qps: 1, burst: 1 },
+        max_pending: 0,
+        max_wait: Duration::ZERO,
+    });
+    let request = Query::query(name("www.sub.example."), RecordType::A);
+    let resolver = build_recursor_with_provider(&config, provider.clone()).unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        resolver.resolve(request.clone(), true),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            hickory_server::resolver::recursor::RecursorError::Message(
+                "upstream pacing capacity exhausted"
+            )
+        ),
+        "{error:?}"
+    );
+    config.recursor.upstream_limits = Some(UpstreamLimits {
+        global: UpstreamQuota { qps: 50, burst: 1 },
+        per_server: UpstreamQuota { qps: 50, burst: 1 },
+        max_pending: 32,
+        max_wait: Duration::from_millis(200),
+    });
+    let resolver = build_recursor_with_provider(&config, provider).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), resolver.resolve(request, true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resolver.is_validating());
+    assert!(!response.answers.is_empty());
+    assert!(
+        response
+            .answers
+            .iter()
+            .all(|record| record.proof.is_secure())
+    );
+}

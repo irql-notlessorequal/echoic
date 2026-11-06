@@ -29,3 +29,5 @@ pub mod rpz;
 pub mod server;
 pub mod stats;
 pub mod tls;
+
+mod upstream;

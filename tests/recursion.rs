@@ -566,3 +566,62 @@ async fn strict_qname_minimization_trusts_intermediate_nxdomain() {
 
     server.stop().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn upstream_pacing_failures_recover_and_cached_answers_bypass_pacing() {
+    use echoic::config::{UpstreamLimits, UpstreamQuota};
+    let directory = tempfile::tempdir().unwrap();
+    let hints = directory.path().join("root.hints");
+    std::fs::write(
+        &hints,
+        format!(". 3600 NS root.test.\nroot.test. 3600 A {ROOT_IP}\n"),
+    )
+    .unwrap();
+    let mut config = config_with_root_hints(&hints, None);
+    config.recursor.upstream_limits = Some(UpstreamLimits {
+        global: UpstreamQuota { qps: 1, burst: 2 },
+        per_server: UpstreamQuota { qps: 1, burst: 2 },
+        max_pending: 0,
+        max_wait: Duration::ZERO,
+    });
+    let counters = Counters::default();
+    let resolver =
+        build_recursor_with_provider(&config, MockProvider::new(counters.clone())).unwrap();
+    let request = Query::query(Name::from_ascii("www.sub.example.").unwrap(), RecordType::A);
+    let mut resolved = false;
+    for _ in 0..16 {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            resolver.resolve(request.clone(), false),
+        )
+        .await
+        .expect("local pacing failure returns promptly")
+        {
+            Ok(message) => {
+                assert!(!message.answers.is_empty());
+                resolved = true;
+                break;
+            }
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    hickory_server::resolver::recursor::RecursorError::Message(
+                        "upstream pacing capacity exhausted"
+                    )
+                ),
+                "{error:?}"
+            ),
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+    }
+    assert!(
+        resolved,
+        "local pacing failures must leave the resolution retryable"
+    );
+    let sent = counters.count(Role::Root) + counters.count(Role::Tld) + counters.count(Role::Auth);
+    resolver.resolve(request, false).await.unwrap();
+    assert_eq!(
+        sent,
+        counters.count(Role::Root) + counters.count(Role::Tld) + counters.count(Role::Auth)
+    );
+}

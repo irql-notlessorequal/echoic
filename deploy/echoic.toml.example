@@ -99,3 +99,10 @@ shutdown_grace = "10s"
 [landing_page]
 # html = "/etc/echoic/landing.html"
 # css = "/etc/echoic/landing.css"
+
+# Optional upstream pacing; rates count DNS messages across all listeners.
+# [recursor.upstream_limits]
+# global = { qps = 2000, burst = 200 }
+# per_server = { qps = 200, burst = 20 }
+# max_pending = 128
+# max_wait = "200ms"

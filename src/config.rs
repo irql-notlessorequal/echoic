@@ -351,6 +351,24 @@ impl Config {
     }
 
     fn validate_recursor(&self, errors: &mut Vec<String>) {
+        if let Some(limits) = &self.recursor.upstream_limits {
+            for (name, quota) in [
+                ("global", &limits.global),
+                ("per_server", &limits.per_server),
+            ] {
+                if quota.qps == 0 || quota.burst == 0 {
+                    errors.push(format!(
+                        "recursor.upstream_limits.{name}: qps and burst must be greater than zero"
+                    ));
+                }
+            }
+            if limits.max_wait > self.server_limits.query_timeout {
+                errors.push(
+                    "recursor.upstream_limits.max_wait must not exceed server_limits.query_timeout"
+                        .to_owned(),
+                );
+            }
+        }
         if self.recursor.response_cache_size == 0 {
             errors.push("recursor.response_cache_size must be greater than zero".to_owned());
         }
@@ -783,6 +801,8 @@ impl ListenerConfig {
 #[serde(deny_unknown_fields)]
 pub struct RecursorConfig {
     #[serde(default)]
+    pub upstream_limits: Option<UpstreamLimits>,
+    #[serde(default)]
     pub root_hints: Option<PathBuf>,
     #[serde(default)]
     pub deny_server: Option<Vec<IpNet>>,
@@ -811,6 +831,7 @@ pub struct RecursorConfig {
 impl Default for RecursorConfig {
     fn default() -> Self {
         Self {
+            upstream_limits: None,
             root_hints: None,
             deny_server: None,
             allow_server: Vec::new(),
@@ -825,6 +846,23 @@ impl Default for RecursorConfig {
             dscp: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamQuota {
+    pub qps: u32,
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamLimits {
+    pub global: UpstreamQuota,
+    pub per_server: UpstreamQuota,
+    pub max_pending: usize,
+    #[serde(with = "humantime_serde")]
+    pub max_wait: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -1023,6 +1061,21 @@ address = "127.0.0.1:5353"
         Config::from_toml_str(config)
             .expect_err("configuration should be rejected")
             .to_string()
+    }
+
+    #[test]
+    fn upstream_limits_are_optional_and_validate_rates_and_waiting() {
+        let config = Config::from_toml_str(MINIMAL_CONFIG).unwrap();
+        assert!(config.recursor.upstream_limits.is_none());
+        let limits = "[recursor.upstream_limits]\nglobal = { qps=100, burst=10 }\nper_server = { qps=20, burst=2 }\nmax_pending=0\nmax_wait='0s'\n";
+        Config::from_toml_str(&format!("{limits}{MINIMAL_CONFIG}")).unwrap();
+        for invalid in [
+            limits.replace("qps=100", "qps=0"),
+            limits.replace("burst=2", "burst=0"),
+            limits.replace("0s", "11s"),
+        ] {
+            assert!(Config::from_toml_str(&format!("{invalid}{MINIMAL_CONFIG}")).is_err());
+        }
     }
 
     #[test]

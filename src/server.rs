@@ -34,10 +34,11 @@ use crate::listeners::{ListenerRuntime, start_listener};
 use crate::persistent_cache::PersistentDnsCache;
 use crate::query::{ListenerQueryState, QueryService};
 use crate::rate_limit::{KeyedRateLimiter, keyed_limiter};
-use crate::recursor::{CachedRecursiveResolver, RecursorHandle, build_recursor};
+use crate::recursor::{CachedRecursiveResolver, RecursorHandle, build_recursor_with_pacer};
 use crate::rpz::RpzPolicy;
 use crate::stats::Stats;
 use crate::tls::{TlsState, install_crypto_provider};
+use crate::upstream::UpstreamPacer;
 
 pub type ReloadHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
@@ -55,6 +56,7 @@ struct ReloadContext {
     config: Arc<ArcSwap<Config>>,
     config_path: Option<PathBuf>,
     recursor_signature: Mutex<String>,
+    upstream: Arc<UpstreamPacer>,
     resolver: RecursorHandle,
     cache_handle: Arc<ArcSwap<Option<Arc<PersistentDnsCache>>>>,
     inflight: Arc<ArcSwap<Arc<Semaphore>>>,
@@ -104,7 +106,8 @@ pub async fn run_with_logging(
             None
         },
     ));
-    let base_resolver = build_recursor(&config)?;
+    let upstream = UpstreamPacer::new(config.recursor.upstream_limits.clone(), stats.clone());
+    let base_resolver = build_recursor_with_pacer(&config, upstream.clone())?;
     let cached_resolver = Arc::new(CachedRecursiveResolver::new(
         base_resolver,
         cache_handle.clone(),
@@ -280,6 +283,7 @@ pub async fn run_with_logging(
     let reload_context = Arc::new(ReloadContext {
         config: config_store.clone(),
         recursor_signature: Mutex::new(signature),
+        upstream,
         config_path: config_path.clone(),
         resolver: resolver_handle.clone(),
         cache_handle: cache_handle.clone(),
@@ -484,7 +488,7 @@ async fn reload_once(
         .then(|| Arc::new(ArcSwap::from_pointee(new_cache.as_ref().map(Arc::clone))));
 
     let new_resolver = if recursor_changed {
-        let base = build_recursor(&new_config)?;
+        let base = build_recursor_with_pacer(&new_config, ctx.upstream.clone())?;
         let cache_handle = new_cache_handle
             .clone()
             .unwrap_or_else(|| ctx.cache_handle.clone());
@@ -709,6 +713,8 @@ async fn reload_once(
         ctx.inflight.store(Arc::new(inflight));
     }
 
+    ctx.upstream
+        .reconfigure(new_config.recursor.upstream_limits.clone());
     *ctx.recursor_signature.lock().unwrap() = signature;
     ctx.config.store(Arc::new(new_config));
 
@@ -787,6 +793,8 @@ pub fn build_filter(logging: &crate::config::LoggingConfig) -> anyhow::Result<En
 }
 
 fn recursor_signature(config: &Config) -> anyhow::Result<String> {
+    let mut recursor = config.recursor.clone();
+    recursor.upstream_limits = None;
     let root_bytes = config
         .recursor
         .root_hints
@@ -803,7 +811,7 @@ fn recursor_signature(config: &Config) -> anyhow::Result<String> {
     Ok(format!(
         "{}{:?}{:?}{:?}{:?}{:?}",
         env!("CARGO_PKG_VERSION"),
-        config.recursor,
+        recursor,
         config.dnssec,
         config.cache,
         root_bytes,
@@ -897,6 +905,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use crate::persistent_cache::{CacheKey, PersistentDnsCache};
+    use crate::recursor::build_recursor;
 
     #[test]
     fn recursor_signature_tracks_file_contents_and_read_errors() {
@@ -940,6 +949,10 @@ mod tests {
         let resolver = build_recursor(&config).unwrap();
         let signature = recursor_signature(&config).unwrap();
         let ctx = ReloadContext {
+            upstream: UpstreamPacer::new(
+                config.recursor.upstream_limits.clone(),
+                Arc::new(Stats::default()),
+            ),
             config: Arc::new(ArcSwap::from_pointee(config)),
             config_path: Some(config_path),
             recursor_signature: Mutex::new(signature.clone()),
@@ -1025,6 +1038,10 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            upstream: UpstreamPacer::new(
+                config.recursor.upstream_limits.clone(),
+                Arc::new(Stats::default()),
+            ),
             recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config.clone())),
             config_path: Some(config_path.clone()),
@@ -1039,7 +1056,7 @@ address = "127.0.0.1:0"
         let updated = initial.replace("validate = false", "validate = true");
         std::fs::write(&config_path, updated).expect("write configuration");
 
-        reload_once(&ctx, tx).await.expect("reload");
+        reload_once(&ctx, tx.clone()).await.expect("reload");
 
         assert!(resolver.is_validating());
         let reloaded_loaded = cache_handle.load_full();
@@ -1048,6 +1065,18 @@ address = "127.0.0.1:0"
         cache.insert(key.clone(), Message::query(), SystemTime::now());
         assert!(reloaded_cache.get(&key, SystemTime::now()).is_none());
         assert!(!cache_path.exists());
+        reloaded_cache.insert(key.clone(), Message::query(), SystemTime::now());
+        let before_resolver = resolver.current();
+        let before_cache = cache_handle.load_full();
+        let paced = format!(
+            "{}\n[recursor.upstream_limits]\nglobal = {{ qps=100, burst=10 }}\nper_server = {{ qps=20, burst=2 }}\nmax_pending=8\nmax_wait='100ms'\n",
+            initial.replace("validate = false", "validate = true")
+        );
+        fs::write(&config_path, paced).unwrap();
+        reload_once(&ctx, tx).await.unwrap();
+        assert!(Arc::ptr_eq(&before_resolver, &resolver.current()));
+        assert!(Arc::ptr_eq(&before_cache, &cache_handle.load_full()));
+        assert!(reloaded_cache.get(&key, SystemTime::now()).is_some());
     }
 
     #[tokio::test]
@@ -1110,6 +1139,10 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            upstream: UpstreamPacer::new(
+                config.recursor.upstream_limits.clone(),
+                Arc::new(Stats::default()),
+            ),
             recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config.clone())),
             config_path: Some(config_path.clone()),
@@ -1209,6 +1242,10 @@ address = "127.0.0.1:0"
         let limiters = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctx = ReloadContext {
+            upstream: UpstreamPacer::new(
+                config.recursor.upstream_limits.clone(),
+                Arc::new(Stats::default()),
+            ),
             recursor_signature: Mutex::new(recursor_signature(&config).expect("signature")),
             config: Arc::new(ArcSwap::from_pointee(config)),
             config_path: Some(config_path.clone()),
