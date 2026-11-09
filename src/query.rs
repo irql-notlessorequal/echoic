@@ -382,6 +382,8 @@ impl QueryService {
             }
         }
 
+        order_cname_chain(&mut message.answers, request.queries.queries()[0].name());
+
         let response_code = message.metadata.response_code;
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.recursion_available = true;
@@ -1241,6 +1243,35 @@ fn negative_from_authority_data(
     })
 }
 
+fn order_cname_chain(answers: &mut [Record], query_name: &Name) {
+    use hickory_server::proto::rr::{LowerName, RData};
+
+    let mut chain = Vec::new();
+    let mut current = LowerName::new(query_name);
+    while chain.len() < answers.len() && !chain.contains(&current) {
+        chain.push(current.clone());
+        let target = answers.iter().find_map(|record| {
+            if LowerName::new(&record.name) == current
+                && let RData::CNAME(target) = &record.data
+            {
+                return Some(LowerName::new(&target.0));
+            }
+            None
+        });
+        let Some(target) = target else {
+            break;
+        };
+        current = target;
+    }
+    answers.sort_by_cached_key(|record| {
+        let owner = LowerName::new(&record.name);
+        chain
+            .iter()
+            .position(|name| *name == owner)
+            .unwrap_or(chain.len())
+    });
+}
+
 fn bogus_record_types(records: &[Record]) -> Vec<RecordType> {
     records
         .iter()
@@ -1325,4 +1356,57 @@ fn drop_simple(header: &Header) -> ResponseInfo {
         metadata,
         counts: HeaderCounts::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_server::proto::rr::{
+        RData,
+        rdata::{A, CNAME},
+    };
+
+    #[test]
+    fn cname_chains_follow_the_question_across_mixed_case_and_multiple_hops() {
+        let first = Name::from_ascii("Alias.Example.").unwrap();
+        let middle = Name::from_ascii("middle.example.").unwrap();
+        let target = Name::from_ascii("target.example.").unwrap();
+        let mut answers = vec![
+            Record::from_rdata(target.clone(), 60, RData::A(A::new(192, 0, 2, 1))),
+            Record::from_rdata(middle.clone(), 120, RData::CNAME(CNAME(target.clone()))),
+            Record::from_rdata(first.clone(), 300, RData::CNAME(CNAME(middle.clone()))),
+        ];
+        order_cname_chain(&mut answers, &Name::from_ascii("alias.example.").unwrap());
+        assert_eq!(
+            answers
+                .iter()
+                .map(|record| record.name.clone())
+                .collect::<Vec<_>>(),
+            vec![first, middle, target]
+        );
+        assert_eq!(
+            answers.iter().map(|record| record.ttl).collect::<Vec<_>>(),
+            vec![300, 120, 60]
+        );
+    }
+
+    #[test]
+    fn cname_cycles_terminate_and_keep_unrelated_records() {
+        let first = Name::from_ascii("first.example.").unwrap();
+        let second = Name::from_ascii("second.example.").unwrap();
+        let mut answers = vec![
+            Record::from_rdata(second.clone(), 60, RData::CNAME(CNAME(first.clone()))),
+            Record::from_rdata(first.clone(), 60, RData::CNAME(CNAME(second.clone()))),
+            Record::from_rdata(
+                Name::from_ascii("other.example.").unwrap(),
+                60,
+                RData::A(A::new(192, 0, 2, 2)),
+            ),
+        ];
+        order_cname_chain(&mut answers, &first);
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0].name, first);
+        assert_eq!(answers[1].name, second);
+        assert_eq!(answers[2].record_type(), RecordType::A);
+    }
 }

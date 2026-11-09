@@ -59,6 +59,19 @@ impl RecursiveResolver for MockResolver {
         response.add_query(query.clone());
 
         match name.as_str() {
+            "alias-order.example." => {
+                response.add_answer(a_record("target.example.", [192, 0, 2, 1], Proof::Secure));
+                let mut alias = Record::from_rdata(
+                    query.name().clone(),
+                    60,
+                    RData::CNAME(hickory_server::proto::rr::rdata::CNAME(
+                        Name::from_ascii("target.example.").unwrap(),
+                    )),
+                );
+                alias.proof = Proof::Secure;
+                response.add_answer(alias);
+                Ok(response)
+            }
             "secure.example." => {
                 response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Secure));
                 Ok(response)
@@ -2216,5 +2229,20 @@ async fn tcp_partial_frame_survives_another_query_completing() {
             .to_string(),
         "www.example."
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn validated_answers_put_cnames_before_target_addresses() {
+    let server = start(Protocol::Tcp, true).await;
+    let response = tcp_query(
+        server.runtime.bound_address,
+        query("alias-order.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.metadata.authentic_data);
+    assert_eq!(response.answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(response.answers[1].record_type(), RecordType::A);
     server.stop().await;
 }
