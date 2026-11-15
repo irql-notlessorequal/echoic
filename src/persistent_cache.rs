@@ -242,6 +242,10 @@ impl PersistentDnsCache {
     }
 
     pub fn insert(&self, key: CacheKey, message: Message, now: SystemTime) {
+        if crate::dnssec::message_is_bogus(&message) {
+            return;
+        }
+
         let ttl = response_ttl(&message, self.config.max_ttl);
         let valid_for = ttl.min(self.config.max_ttl);
         if valid_for.is_zero() {
@@ -597,6 +601,28 @@ mod tests {
         assert!(!answer.metadata.authentic_data);
         assert!(!answer.answers[0].proof.is_secure());
         assert_eq!(answer.answers[0].ttl, 0);
+    }
+
+    #[test]
+    fn bogus_answers_are_not_cached() {
+        use hickory_server::proto::dnssec::Proof;
+        use hickory_server::proto::rr::{RData, Record, rdata::A};
+        let cfg = config(false, true, None);
+        let cache = PersistentDnsCache::new(&cfg);
+        let name = Name::from_ascii("example.com.").unwrap();
+        let key = CacheKey {
+            name: name.clone(),
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            dnssec_ok: true,
+        };
+        let mut answer = message();
+        let mut record = Record::from_rdata(name, 60, RData::A(A::new(192, 0, 2, 1)));
+        record.proof = Proof::Bogus;
+        answer.add_answer(record);
+        let now = SystemTime::now();
+        cache.insert(key.clone(), answer, now);
+        assert!(cache.get(&key, now).is_none());
     }
 
     #[tokio::test]

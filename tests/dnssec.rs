@@ -31,9 +31,10 @@ use hickory_server::net::NetError;
 use hickory_server::net::runtime::{TokioRuntimeProvider, TokioTime};
 use hickory_server::net::xfer::{DnsHandle, Protocol};
 use hickory_server::proto::dnssec::crypto::RsaSigningKey;
-use hickory_server::proto::dnssec::rdata::{DNSKEY, DNSSECRData, DS};
+use hickory_server::proto::dnssec::rdata::{DNSKEY, DNSSECRData, DS, NSEC};
 use hickory_server::proto::dnssec::{Algorithm, DigestType, DnssecSigner, SigningKey};
 use hickory_server::proto::op::{DnsRequest, DnsResponse, Edns, Message, Query, ResponseCode};
+use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_server::proto::rr::rdata::{A, NS, SOA};
 use hickory_server::proto::rr::{LowerName, Name, RData, Record, RecordType, RrKey};
 use hickory_server::proto::serialize::binary::BinEncoder;
@@ -101,6 +102,18 @@ enum DsResponseMode {
     Empty,
 }
 
+#[derive(Clone, Copy)]
+enum AncestorNsMode {
+    Normal,
+    ServFail,
+}
+
+#[derive(Clone, Copy)]
+enum NsecProofMode {
+    Valid,
+    Tampered,
+}
+
 #[derive(Clone)]
 struct SignedProvider {
     root: Arc<Catalog>,
@@ -108,16 +121,24 @@ struct SignedProvider {
     auth: Arc<Catalog>,
     runtime: TokioRuntimeProvider,
     ds_mode: DsResponseMode,
+    ns_mode: AncestorNsMode,
 }
 
 impl SignedProvider {
-    fn new(root: Catalog, tld: Catalog, auth: Catalog, ds_mode: DsResponseMode) -> Self {
+    fn new(
+        root: Catalog,
+        tld: Catalog,
+        auth: Catalog,
+        ds_mode: DsResponseMode,
+        ns_mode: AncestorNsMode,
+    ) -> Self {
         Self {
             root: Arc::new(root),
             tld: Arc::new(tld),
             auth: Arc::new(auth),
             runtime: TokioRuntimeProvider::new(),
             ds_mode,
+            ns_mode,
         }
     }
 }
@@ -146,6 +167,7 @@ impl ConnectionProvider for SignedProvider {
         Ok(std::future::ready(Ok(SignedHandle {
             catalog,
             ds_mode: self.ds_mode,
+            ns_mode: self.ns_mode,
         })))
     }
 
@@ -158,6 +180,7 @@ impl ConnectionProvider for SignedProvider {
 struct SignedHandle {
     catalog: Arc<Catalog>,
     ds_mode: DsResponseMode,
+    ns_mode: AncestorNsMode,
 }
 
 impl DnsHandle for SignedHandle {
@@ -167,8 +190,9 @@ impl DnsHandle for SignedHandle {
     fn send(&self, request: DnsRequest) -> Self::Response {
         let catalog = self.catalog.clone();
         let ds_mode = self.ds_mode;
+        let ns_mode = self.ns_mode;
         Box::pin(futures_util::stream::once(async move {
-            answer(&catalog, &request, ds_mode).await
+            answer(&catalog, &request, ds_mode, ns_mode).await
         }))
     }
 }
@@ -177,6 +201,7 @@ async fn answer(
     catalog: &Catalog,
     request: &DnsRequest,
     ds_mode: DsResponseMode,
+    ns_mode: AncestorNsMode,
 ) -> Result<DnsResponse, NetError> {
     let query = request
         .queries
@@ -229,6 +254,15 @@ async fn answer(
     }
     if query_type == RecordType::NS {
         add_glue(&mut message);
+    }
+    if query_type == RecordType::NS
+        && matches!(ns_mode, AncestorNsMode::ServFail)
+        && query_name == name("child.insecure.example.")
+    {
+        message.answers.clear();
+        message.authorities.clear();
+        message.additionals.clear();
+        message.metadata.response_code = ResponseCode::ServFail;
     }
     DnsResponse::from_message(message).map_err(NetError::from)
 }
@@ -351,7 +385,53 @@ fn catalog(zone: InMemoryZoneHandler) -> Catalog {
     catalog
 }
 
+fn tamper_nsec(zone: &mut InMemoryZoneHandler) {
+    let keys: Vec<RrKey> = zone
+        .records_get_mut()
+        .keys()
+        .filter(|key| key.record_type == RecordType::NSEC)
+        .cloned()
+        .collect();
+    for key in keys {
+        let rrsigs = zone
+            .records_get_mut()
+            .get(&key)
+            .map(|rrset| rrset.rrsigs().to_vec())
+            .unwrap_or_default();
+        let owner = Name::from(key.name.clone());
+        zone.upsert_mut(
+            Record::from_rdata(
+                owner,
+                300,
+                RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
+                    name("tampered.invalid."),
+                    [
+                        RecordType::A,
+                        RecordType::NSEC,
+                        RecordType::RRSIG,
+                        RecordType::SOA,
+                    ],
+                ))),
+            ),
+            1,
+        );
+        if let Some(rrset) = zone.records_get_mut().get_mut(&key) {
+            for rrsig in rrsigs {
+                Arc::make_mut(rrset).insert_rrsig(rrsig);
+            }
+        }
+    }
+}
+
 fn signed_hierarchy(ds_mode: DsResponseMode) -> (SignedProvider, DNSKEY) {
+    signed_hierarchy_with_modes(ds_mode, AncestorNsMode::Normal, NsecProofMode::Valid)
+}
+
+fn signed_hierarchy_with_modes(
+    ds_mode: DsResponseMode,
+    ns_mode: AncestorNsMode,
+    nsec_mode: NsecProofMode,
+) -> (SignedProvider, DNSKEY) {
     let sub_origin = name("sub.example.");
     let sub = zone(
         &sub_origin,
@@ -407,6 +487,9 @@ fn signed_hierarchy(ds_mode: DsResponseMode) -> (SignedProvider, DNSKEY) {
         for rrsig in rrsigs {
             Arc::make_mut(rrset).insert_rrsig(rrsig);
         }
+    }
+    if matches!(nsec_mode, NsecProofMode::Tampered) {
+        tamper_nsec(&mut bogus);
     }
 
     let insecure_origin = name("insecure.example.");
@@ -503,7 +586,7 @@ fn signed_hierarchy(ds_mode: DsResponseMode) -> (SignedProvider, DNSKEY) {
     );
 
     (
-        SignedProvider::new(catalog(root), catalog(example), auth, ds_mode),
+        SignedProvider::new(catalog(root), catalog(example), auth, ds_mode, ns_mode),
         root_key,
     )
 }
@@ -552,6 +635,21 @@ async fn start_dnssec_server_with_validation(validate: bool) -> DnssecServer {
 }
 
 async fn start_dnssec_server(validate: bool, ds_mode: DsResponseMode) -> DnssecServer {
+    start_dnssec_server_with_modes(
+        ds_mode,
+        AncestorNsMode::Normal,
+        NsecProofMode::Valid,
+        validate,
+    )
+    .await
+}
+
+async fn start_dnssec_server_with_modes(
+    ds_mode: DsResponseMode,
+    ns_mode: AncestorNsMode,
+    nsec_mode: NsecProofMode,
+    validate: bool,
+) -> DnssecServer {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root_hints = directory.path().join("root.hints");
     std::fs::write(
@@ -562,7 +660,7 @@ async fn start_dnssec_server(validate: bool, ds_mode: DsResponseMode) -> DnssecS
     )
     .expect("write root hints");
 
-    let (provider, root_key) = signed_hierarchy(ds_mode);
+    let (provider, root_key) = signed_hierarchy_with_modes(ds_mode, ns_mode, nsec_mode);
     let trust_anchor = directory.path().join("trust-anchor.key");
     std::fs::write(&trust_anchor, format!(". 3600 IN DNSKEY {root_key}\n"))
         .expect("write trust anchor");
@@ -611,6 +709,19 @@ async fn udp_query(address: SocketAddr, message: Message) -> Message {
         .expect("query timed out")
         .expect("receive response");
     Message::from_vec(&buffer[..length]).expect("decode response")
+}
+
+fn ede_info_code(response: &Message) -> Option<u16> {
+    response
+        .edns
+        .as_ref()?
+        .option(EdnsCode::Unknown(15))
+        .and_then(|option| match option {
+            EdnsOption::Unknown(_, bytes) if bytes.len() >= 2 => {
+                Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+            }
+            _ => None,
+        })
 }
 
 #[tokio::test]
@@ -701,6 +812,54 @@ async fn rejects_child_soa_for_secure_delegation() {
     assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
     assert!(response.answers.is_empty());
     assert_eq!(server.stats.snapshot().servfail, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn continues_zone_cut_search_when_ancestor_ns_lookup_fails() {
+    let server = start_dnssec_server_with_modes(
+        DsResponseMode::Normal,
+        AncestorNsMode::ServFail,
+        NsecProofMode::Valid,
+        true,
+    )
+    .await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("www.child.insecure.example.", RecordType::A),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(!response.metadata.authentic_data);
+    assert!(response.answers.iter().any(|record| {
+        matches!(record.data, RData::A(address) if address.0 == Ipv4Addr::new(192, 0, 2, 40))
+    }));
+    assert_eq!(server.stats.snapshot().servfail, 0);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn bogus_nsec_proof_returns_extended_dns_error() {
+    let server = start_dnssec_server_with_modes(
+        DsResponseMode::Normal,
+        AncestorNsMode::Normal,
+        NsecProofMode::Tampered,
+        true,
+    )
+    .await;
+
+    let mut message = query("missing.bogus.example.", RecordType::A);
+    let mut edns = Edns::new();
+    edns.set_version(0);
+    edns.set_max_payload(4096);
+    message.set_edns(edns);
+
+    let response = udp_query(server.runtime.bound_address, message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(ede_info_code(&response), Some(6));
 
     server.stop().await;
 }

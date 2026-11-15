@@ -36,6 +36,7 @@ use hickory_server::zone_handler::{MessageResponseBuilder, Queries};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
+use crate::dnssec::message_is_bogus;
 use crate::net::normalize_ip;
 use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
 use crate::recursor::{RecursiveResolver, RecursorHandle};
@@ -1136,17 +1137,37 @@ impl QueryService {
         validating: bool,
         started: Instant,
     ) -> ResponseInfo {
-        if let Some(negative) = negative_response(&error) {
-            return self
-                .send_negative(
-                    request,
-                    response_handle,
-                    negative,
-                    state,
-                    validating,
-                    started,
-                )
-                .await;
+        match negative_response(&error) {
+            Some(NegativeOutcome::Answer(negative)) => {
+                return self
+                    .send_negative(
+                        request,
+                        response_handle,
+                        *negative,
+                        state,
+                        validating,
+                        started,
+                    )
+                    .await;
+            }
+            Some(NegativeOutcome::Bogus) => {
+                tracing::warn!(
+                    listener = %self.listener_name,
+                    error = %error,
+                    "DNSSEC validation failed"
+                );
+                return self
+                    .send_status(
+                        request,
+                        response_handle,
+                        ResponseCode::ServFail,
+                        Some(ExtendedDnsError::DnssecBogus),
+                        state,
+                        started,
+                    )
+                    .await;
+            }
+            None => {}
         }
 
         if matches!(
@@ -1188,7 +1209,12 @@ struct NegativeResponse {
     secure: bool,
 }
 
-fn negative_response(error: &RecursorError) -> Option<NegativeResponse> {
+enum NegativeOutcome {
+    Answer(Box<NegativeResponse>),
+    Bogus,
+}
+
+fn negative_response(error: &RecursorError) -> Option<NegativeOutcome> {
     match error {
         RecursorError::Negative(data) => {
             let response_code = if data.is_nx_domain() {
@@ -1196,14 +1222,21 @@ fn negative_response(error: &RecursorError) -> Option<NegativeResponse> {
             } else {
                 ResponseCode::NoError
             };
-            negative_from_authority_data(data.authorities.clone(), data.soa.clone(), response_code)
+            Some(negative_from_authority_data(
+                data.authorities.clone(),
+                data.soa.clone(),
+                response_code,
+            ))
         }
         RecursorError::Net(NetError::Dns(DnsError::NoRecordsFound(records))) => {
-            negative_from_authority_data(
+            Some(negative_from_authority_data(
                 records.authorities.clone(),
                 records.soa.clone(),
                 records.response_code,
-            )
+            ))
+        }
+        RecursorError::Net(NetError::Dns(DnsError::Nsec { proof, .. })) if proof.is_bogus() => {
+            Some(NegativeOutcome::Bogus)
         }
         _ => None,
     }
@@ -1213,7 +1246,7 @@ fn negative_from_authority_data(
     authorities: Option<std::sync::Arc<[Record]>>,
     soa: Option<Box<Record<SOA>>>,
     response_code: ResponseCode,
-) -> Option<NegativeResponse> {
+) -> NegativeOutcome {
     let authorities = authorities
         .map(|records| {
             records
@@ -1229,18 +1262,18 @@ fn negative_from_authority_data(
         .chain(soa.iter())
         .any(|record| record.proof.is_bogus())
     {
-        return None;
+        return NegativeOutcome::Bogus;
     }
     let secure = (!authorities.is_empty() || soa.is_some())
         && authorities.iter().all(|record| record.proof.is_secure())
         && soa.as_ref().is_none_or(|record| record.proof.is_secure());
 
-    Some(NegativeResponse {
+    NegativeOutcome::Answer(Box::new(NegativeResponse {
         response_code,
         authorities,
         soa,
         secure,
-    })
+    }))
 }
 
 fn order_cname_chain(answers: &mut [Record], query_name: &Name) {
@@ -1278,14 +1311,6 @@ fn bogus_record_types(records: &[Record]) -> Vec<RecordType> {
         .filter(|record| record.proof.is_bogus())
         .map(Record::record_type)
         .collect()
-}
-
-fn message_is_bogus(message: &hickory_server::proto::op::Message) -> bool {
-    message
-        .answers
-        .iter()
-        .chain(message.authorities.iter())
-        .any(|record| record.proof.is_bogus())
 }
 
 fn message_is_secure(message: &hickory_server::proto::op::Message) -> bool {

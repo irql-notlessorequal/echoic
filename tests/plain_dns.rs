@@ -116,6 +116,13 @@ impl RecursiveResolver for MockResolver {
                 response.add_answer(a_record(&name, [192, 0, 2, 1], Proof::Bogus));
                 Ok(response)
             }
+            "bogus-negative.example." => Err(RecursorError::Negative(AuthorityData::new(
+                Box::new(query),
+                Some(Box::new(soa_record(&name, Proof::Bogus))),
+                true,
+                false,
+                None,
+            ))),
             _ => {
                 response.add_answer(a_record(&name, [192, 0, 2, 10], Proof::Indeterminate));
                 Ok(response)
@@ -1826,6 +1833,42 @@ address = "127.0.0.1:0"
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(
         Name::from_ascii("bogus.example.").expect("name"),
+        RecordType::A,
+    ));
+    message.set_edns(Edns::new());
+    let response = udp_query(address, message).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(ede_info_code(&response), Some(6));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn dnssec_bogus_negative_includes_extended_dns_error() {
+    let source = r#"
+[logging]
+level = "off"
+
+[server_limits]
+max_udp_payload = 512
+query_timeout = "2s"
+
+[dnssec]
+enabled = true
+
+[[listeners]]
+name = "test"
+protocol = "udp"
+address = "127.0.0.1:0"
+"#;
+    let config = Config::from_toml_str(source).expect("config");
+    let server = start_config(&config, true, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut message = Message::query();
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(
+        Name::from_ascii("bogus-negative.example.").expect("name"),
         RecordType::A,
     ));
     message.set_edns(Edns::new());
