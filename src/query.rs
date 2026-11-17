@@ -13,9 +13,10 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
+use std::collections::HashMap;
 use std::iter;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
@@ -43,6 +44,71 @@ use crate::recursor::{RecursiveResolver, RecursorHandle};
 use crate::stats::Stats;
 
 const KEEPALIVE_TIMEOUT_UNIT_MS: u128 = 100;
+const WARNING_BURST: usize = 3;
+const WARNING_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum WarningKind {
+    DnssecBogus,
+    RecursiveFailure,
+    QueryTimeout,
+}
+
+impl WarningKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DnssecBogus => "DNSSEC validation failed",
+            Self::RecursiveFailure => "recursive query failed",
+            Self::QueryTimeout => "query timed out",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThrottleState {
+    window_start: Instant,
+    emitted: usize,
+    suppressed: usize,
+}
+
+#[derive(Debug, Default)]
+struct WarningThrottle {
+    states: Mutex<HashMap<WarningKind, ThrottleState>>,
+}
+
+enum ThrottleDecision {
+    Emit,
+    Summary(usize),
+    Suppress,
+}
+
+impl WarningThrottle {
+    fn decide(&self, kind: WarningKind) -> ThrottleDecision {
+        let now = Instant::now();
+        let mut states = self.states.lock().expect("warning throttle lock");
+        let state = states.entry(kind).or_insert_with(|| ThrottleState {
+            window_start: now,
+            emitted: 0,
+            suppressed: 0,
+        });
+        if now.duration_since(state.window_start) >= WARNING_WINDOW {
+            let suppressed = state.suppressed;
+            state.window_start = now;
+            state.emitted = 0;
+            state.suppressed = 0;
+            if suppressed > 0 {
+                return ThrottleDecision::Summary(suppressed);
+            }
+        }
+        if state.emitted < WARNING_BURST {
+            state.emitted += 1;
+            ThrottleDecision::Emit
+        } else {
+            state.suppressed += 1;
+            ThrottleDecision::Suppress
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum ExtendedDnsError {
@@ -133,6 +199,7 @@ pub struct QueryService {
     state: Arc<ArcSwap<ListenerQueryState>>,
     stats: Arc<Stats>,
     inflight: Arc<ArcSwap<Arc<Semaphore>>>,
+    warnings: Arc<WarningThrottle>,
 }
 
 impl QueryService {
@@ -168,6 +235,23 @@ impl QueryService {
             state: Arc::new(ArcSwap::from_pointee(state)),
             stats,
             inflight,
+            warnings: Arc::new(WarningThrottle::default()),
+        }
+    }
+
+    fn log_warning<F>(&self, kind: WarningKind, detail: F)
+    where
+        F: FnOnce(),
+    {
+        match self.warnings.decide(kind) {
+            ThrottleDecision::Emit => detail(),
+            ThrottleDecision::Summary(count) => tracing::warn!(
+                listener = %self.listener_name,
+                kind = kind.label(),
+                suppressed = count,
+                "warning summary"
+            ),
+            ThrottleDecision::Suppress => {}
         }
     }
 
@@ -348,12 +432,14 @@ impl QueryService {
             if message_is_bogus(&message) {
                 let answer_types = bogus_record_types(&message.answers);
                 let authority_types = bogus_record_types(&message.authorities);
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    answer_types = ?answer_types,
-                    authority_types = ?authority_types,
-                    "DNSSEC validation failed"
-                );
+                self.log_warning(WarningKind::DnssecBogus, || {
+                    tracing::warn!(
+                        listener = %self.listener_name,
+                        answer_types = ?answer_types,
+                        authority_types = ?authority_types,
+                        "DNSSEC validation failed"
+                    );
+                });
                 return self
                     .send_status(
                         request,
@@ -1093,11 +1179,14 @@ impl QueryService {
             }
             Err(_) => {
                 self.stats.record_upstream_failure();
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    timeout_ms = state.query_timeout.as_millis(),
-                    "query timed out"
-                );
+                let timeout_ms = state.query_timeout.as_millis();
+                self.log_warning(WarningKind::QueryTimeout, || {
+                    tracing::warn!(
+                        listener = %self.listener_name,
+                        timeout_ms = timeout_ms,
+                        "query timed out"
+                    );
+                });
                 if let Some(message) = resolver
                     .stale_cached_response(query.clone(), dnssec_ok)
                     .await
@@ -1151,11 +1240,13 @@ impl QueryService {
                     .await;
             }
             Some(NegativeOutcome::Bogus) => {
-                tracing::warn!(
-                    listener = %self.listener_name,
-                    error = %error,
-                    "DNSSEC validation failed"
-                );
+                self.log_warning(WarningKind::DnssecBogus, || {
+                    tracing::warn!(
+                        listener = %self.listener_name,
+                        error = %error,
+                        "DNSSEC validation failed"
+                    );
+                });
                 return self
                     .send_status(
                         request,
@@ -1185,11 +1276,13 @@ impl QueryService {
                 )
                 .await;
         }
-        tracing::warn!(
-            listener = %self.listener_name,
-            error = %error,
-            "recursive query failed"
-        );
+        self.log_warning(WarningKind::RecursiveFailure, || {
+            tracing::warn!(
+                listener = %self.listener_name,
+                error = %error,
+                "recursive query failed"
+            );
+        });
         self.send_status(
             request,
             response_handle,
@@ -1390,6 +1483,57 @@ mod tests {
         RData,
         rdata::{A, CNAME},
     };
+
+    #[test]
+    fn warning_throttle_bursts_then_summarizes() {
+        let throttle = WarningThrottle::default();
+        for _ in 0..WARNING_BURST {
+            assert!(matches!(
+                throttle.decide(WarningKind::DnssecBogus),
+                ThrottleDecision::Emit
+            ));
+        }
+        for _ in 0..3 {
+            assert!(matches!(
+                throttle.decide(WarningKind::DnssecBogus),
+                ThrottleDecision::Suppress
+            ));
+        }
+        throttle
+            .states
+            .lock()
+            .unwrap()
+            .get_mut(&WarningKind::DnssecBogus)
+            .unwrap()
+            .window_start -= WARNING_WINDOW * 2;
+        assert!(matches!(
+            throttle.decide(WarningKind::DnssecBogus),
+            ThrottleDecision::Summary(3)
+        ));
+        assert!(matches!(
+            throttle.decide(WarningKind::DnssecBogus),
+            ThrottleDecision::Emit
+        ));
+    }
+
+    #[test]
+    fn warning_throttle_tracks_kinds_independently() {
+        let throttle = WarningThrottle::default();
+        for _ in 0..WARNING_BURST {
+            assert!(matches!(
+                throttle.decide(WarningKind::QueryTimeout),
+                ThrottleDecision::Emit
+            ));
+        }
+        assert!(matches!(
+            throttle.decide(WarningKind::QueryTimeout),
+            ThrottleDecision::Suppress
+        ));
+        assert!(matches!(
+            throttle.decide(WarningKind::RecursiveFailure),
+            ThrottleDecision::Emit
+        ));
+    }
 
     #[test]
     fn cname_chains_follow_the_question_across_mixed_case_and_multiple_hops() {

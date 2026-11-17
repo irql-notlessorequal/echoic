@@ -283,6 +283,61 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
             return Ok(message);
         }
 
+        // Enforce NSEC3 iteration limits before the positive-response return below. A positive
+        // answer needs no denial proof, but an attacker-supplied NSEC3 record in the authority
+        // section must not bypass these limits.
+        let max_iterations = message
+            .authorities
+            .iter()
+            .filter(|rr| rr.proof == Proof::Secure && rr.record_type() == RecordType::NSEC3)
+            .filter_map(|rr| match &rr.data {
+                RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) => Some(nsec3.iterations()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_default();
+        if max_iterations > self.nsec3_hard_iteration_limit {
+            debug!(
+                %query,
+                iterations = max_iterations,
+                hard_limit = self.nsec3_hard_iteration_limit,
+                "NSEC3 iteration count is over hard limit"
+            );
+            return Err(NetError::from(DnsError::Nsec {
+                query: Box::new(query.clone()),
+                response: Box::new(message),
+                proof: Proof::Bogus,
+            }));
+        }
+        if max_iterations > self.nsec3_soft_iteration_limit {
+            debug!(
+                %query,
+                iterations = max_iterations,
+                soft_limit = self.nsec3_soft_iteration_limit,
+                "NSEC3 iteration count is over soft limit"
+            );
+            return Err(NetError::from(DnsError::Nsec {
+                query: Box::new(query.clone()),
+                response: Box::new(message),
+                proof: Proof::Insecure,
+            }));
+        }
+
+        // A positive answer that matches the question needs no denial proof. This happens when a
+        // CNAME crosses into a different signed zone whose NODATA proof is included in the
+        // authority section; validating that proof against the original question yields a false
+        // Bogus result. Wildcard-expanded answers set must_validate_nsec and still get their
+        // denial proof checked below.
+        if !must_validate_nsec
+            && message.answers.iter().any(|record| {
+                record.name == query.name
+                    && (record.record_type() == RecordType::CNAME
+                        || record.record_type() == query.query_type)
+            })
+        {
+            return Ok(message);
+        }
+
         let nsec3s = message
             .authorities
             .iter()

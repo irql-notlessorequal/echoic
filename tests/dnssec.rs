@@ -35,7 +35,7 @@ use hickory_server::proto::dnssec::rdata::{DNSKEY, DNSSECRData, DS, NSEC};
 use hickory_server::proto::dnssec::{Algorithm, DigestType, DnssecSigner, SigningKey};
 use hickory_server::proto::op::{DnsRequest, DnsResponse, Edns, Message, Query, ResponseCode};
 use hickory_server::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
-use hickory_server::proto::rr::rdata::{A, NS, SOA};
+use hickory_server::proto::rr::rdata::{A, CNAME, NS, SOA};
 use hickory_server::proto::rr::{LowerName, Name, RData, Record, RecordType, RrKey};
 use hickory_server::proto::serialize::binary::BinEncoder;
 use hickory_server::resolver::config::ConnectionConfig;
@@ -440,6 +440,11 @@ fn signed_hierarchy_with_modes(
             ns(&sub_origin, "ns.sub.example."),
             a("ns.sub.example.", AUTH_IP),
             a("www.sub.example.", Ipv4Addr::new(192, 0, 2, 10)),
+            Record::from_rdata(
+                name("alias.sub.example."),
+                300,
+                RData::CNAME(CNAME(name("www.bogus.example."))),
+            ),
             ns(&name("child.sub.example."), "ns.child.sub.example."),
             a("ns.child.sub.example.", AUTH_IP),
         ],
@@ -758,6 +763,25 @@ async fn validates_secure_insecure_and_bogus_answers() {
     assert_eq!(bogus.metadata.response_code, ResponseCode::ServFail);
     assert!(bogus.answers.is_empty());
     assert_eq!(server.stats.snapshot().servfail, 1);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn cross_zone_cname_with_nodata_authority_is_not_bogus() {
+    let server = start_dnssec_server_with_validation(true).await;
+
+    let response = udp_query(
+        server.runtime.bound_address,
+        query("alias.sub.example.", RecordType::AAAA),
+    )
+    .await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.metadata.authentic_data);
+    assert!(response.answers.iter().any(|record| {
+        matches!(&record.data, RData::CNAME(target) if target.0 == name("www.bogus.example."))
+    }));
+    assert_eq!(server.stats.snapshot().servfail, 0);
 
     server.stop().await;
 }
