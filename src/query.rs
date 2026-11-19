@@ -36,7 +36,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use hickory_server::zone_handler::{MessageResponseBuilder, Queries};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::{AclConfig, ListenerConfig, Protocol, ServerLimits};
+use crate::config::{AclConfig, EdnsConfig, ListenerConfig, Protocol, ServerLimits};
 use crate::dnssec::message_is_bogus;
 use crate::net::normalize_ip;
 use crate::rate_limit::{KeyedRateLimiter, RateKey, keyed_limiter};
@@ -176,6 +176,7 @@ pub struct ListenerQueryState {
     pub query_names: bool,
     pub require_dot_alpn: bool,
     pub edns_padding_block_size: usize,
+    pub edns_padding_random: bool,
     pub blocklist: Arc<crate::rpz::RpzPolicy>,
 }
 
@@ -190,6 +191,17 @@ fn padding_requested(request: &Request, state: &ListenerQueryState) -> bool {
 fn padding_len(state: &ListenerQueryState, base_len: usize) -> usize {
     let block_size = state.edns_padding_block_size;
     (block_size - ((base_len + 4) % block_size)) % block_size
+}
+
+fn padding_bytes(state: &ListenerQueryState, len: usize) -> Vec<u8> {
+    let mut padding = vec![0; len];
+    if state.edns_padding_random
+        && let Err(error) = getrandom::fill(&mut padding)
+    {
+        tracing::debug!(%error, "failed to generate random EDNS padding");
+        padding.fill(0);
+    }
+    padding
 }
 
 pub struct QueryService {
@@ -210,6 +222,7 @@ impl QueryService {
         stats: Arc<Stats>,
         inflight: Arc<ArcSwap<Arc<Semaphore>>>,
         server_limits: &ServerLimits,
+        edns: &EdnsConfig,
         refuse_any: bool,
         query_names: bool,
         blocklist: Arc<crate::rpz::RpzPolicy>,
@@ -224,7 +237,8 @@ impl QueryService {
             idle_timeout: server_limits.idle_timeout,
             query_names,
             require_dot_alpn: listener.require_dot_alpn,
-            edns_padding_block_size: listener.edns_padding_block_size(),
+            edns_padding_block_size: edns.padding_block_size,
+            edns_padding_random: edns.padding_random,
             blocklist,
         };
 
@@ -522,7 +536,7 @@ impl QueryService {
                     Ok(_) => {
                         edns.options_mut().insert(EdnsOption::Unknown(
                             EdnsCode::Padding.into(),
-                            vec![0; padding_len(state, bytes.len())],
+                            padding_bytes(state, padding_len(state, bytes.len())),
                         ));
                     }
                     Err(error) => tracing::debug!(%error, "failed to measure DNS response padding"),

@@ -39,6 +39,7 @@ const DEFAULT_RESPONSE_CACHE_SIZE: u64 = 1_048_576;
 const DEFAULT_NS_CACHE_SIZE: usize = 1_024;
 const DEFAULT_RECURSION_LIMIT: u8 = 24;
 const DEFAULT_EDNS_PAYLOAD_LEN: u16 = 1232;
+const DEFAULT_EDNS_PADDING_BLOCK_SIZE: usize = 128;
 const DEFAULT_MAX_UDP_PAYLOAD: u16 = 1232;
 const DEFAULT_MAX_DOH_BODY: usize = 65_535;
 const DEFAULT_MAX_DOH_URI: usize = 8_192;
@@ -68,6 +69,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub edns: EdnsConfig,
     #[serde(default)]
     pub tls: Vec<TlsConfig>,
     #[serde(default)]
@@ -150,6 +153,7 @@ impl Config {
 
         self.validate_tls(&mut errors);
         self.validate_listeners(&mut errors);
+        self.validate_edns(&mut errors);
         self.validate_logging(&mut errors);
         self.validate_recursor(&mut errors);
         self.validate_dnssec(&mut errors);
@@ -329,15 +333,13 @@ impl Config {
             }
 
             validate_listener_limits(listener, errors);
-            if let Some(value) = listener.edns_padding_block_size
-                && value != 0
-                && !(16..=4096).contains(&value)
-            {
-                errors.push(format!(
-                    "listener {:?}: edns_padding_block_size must be 0 or between 16 and 4096",
-                    listener.name
-                ));
-            }
+        }
+    }
+
+    fn validate_edns(&self, errors: &mut Vec<String>) {
+        let block_size = self.edns.padding_block_size;
+        if block_size != 0 && !(16..=4096).contains(&block_size) {
+            errors.push("edns.padding_block_size must be 0 or between 16 and 4096".to_owned());
         }
     }
 
@@ -725,6 +727,24 @@ impl Default for PolicyConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdnsConfig {
+    #[serde(default = "default_edns_padding_block_size")]
+    pub padding_block_size: usize,
+    #[serde(default)]
+    pub padding_random: bool,
+}
+
+impl Default for EdnsConfig {
+    fn default() -> Self {
+        Self {
+            padding_block_size: DEFAULT_EDNS_PADDING_BLOCK_SIZE,
+            padding_random: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LandingPageConfig {
@@ -778,8 +798,6 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub hostname: Option<String>,
     #[serde(default)]
-    pub edns_padding_block_size: Option<usize>,
-    #[serde(default)]
     pub require_dot_alpn: bool,
     #[serde(default)]
     pub tcp_notsent_lowat: Option<u32>,
@@ -788,10 +806,6 @@ pub struct ListenerConfig {
 }
 
 impl ListenerConfig {
-    pub fn edns_padding_block_size(&self) -> usize {
-        self.edns_padding_block_size.unwrap_or(128)
-    }
-
     pub fn tcp_notsent_lowat(&self) -> u32 {
         self.tcp_notsent_lowat.unwrap_or(DEFAULT_TCP_NOTSENT_LOWAT)
     }
@@ -1018,6 +1032,10 @@ fn default_edns_payload_len() -> u16 {
     DEFAULT_EDNS_PAYLOAD_LEN
 }
 
+fn default_edns_padding_block_size() -> usize {
+    DEFAULT_EDNS_PADDING_BLOCK_SIZE
+}
+
 fn default_max_udp_payload() -> u16 {
     DEFAULT_MAX_UDP_PAYLOAD
 }
@@ -1076,6 +1094,49 @@ address = "127.0.0.1:5353"
         ] {
             assert!(Config::from_toml_str(&format!("{invalid}{MINIMAL_CONFIG}")).is_err());
         }
+    }
+
+    #[test]
+    fn edns_padding_defaults_and_validation() {
+        let config = Config::from_toml_str(MINIMAL_CONFIG).expect("minimal config");
+        assert_eq!(config.edns.padding_block_size, 128);
+        assert!(!config.edns.padding_random);
+
+        let config = Config::from_toml_str(&format!(
+            "[edns]\npadding_block_size = 0\npadding_random = true\n{MINIMAL_CONFIG}"
+        ))
+        .expect("edns config");
+        assert_eq!(config.edns.padding_block_size, 0);
+        assert!(config.edns.padding_random);
+
+        for valid in [16, 4096] {
+            Config::from_toml_str(&format!(
+                "[edns]\npadding_block_size = {valid}\n{MINIMAL_CONFIG}"
+            ))
+            .expect("valid block size");
+        }
+
+        for invalid in [1, 15, 4097] {
+            let message = validation_message(&format!(
+                "[edns]\npadding_block_size = {invalid}\n{MINIMAL_CONFIG}"
+            ));
+            assert!(message.contains("edns.padding_block_size"));
+        }
+    }
+
+    #[test]
+    fn listener_level_edns_padding_block_size_is_rejected() {
+        let config = r#"
+[[listeners]]
+name = "lan"
+protocol = "udp"
+address = "127.0.0.1:5353"
+edns_padding_block_size = 128
+"#;
+        assert!(matches!(
+            Config::from_toml_str(config),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub async fn run_with_logging(
             stats.clone(),
             inflight_store.clone(),
             &config.server_limits,
+            &config.edns,
             config.policy.refuse_any,
             config.logging.query_names,
             blocklist.clone(),
@@ -569,7 +570,8 @@ async fn reload_once(
                 idle_timeout: new_config.server_limits.idle_timeout,
                 query_names: new_config.logging.query_names,
                 require_dot_alpn: new_listener.require_dot_alpn,
-                edns_padding_block_size: new_listener.edns_padding_block_size(),
+                edns_padding_block_size: new_config.edns.padding_block_size,
+                edns_padding_random: new_config.edns.padding_random,
                 blocklist: new_blocklist.clone(),
             };
 

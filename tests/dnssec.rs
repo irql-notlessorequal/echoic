@@ -679,6 +679,7 @@ async fn start_dnssec_server_with_modes(
         stats.clone(),
         Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(16)))),
         &config.server_limits,
+        &config.edns,
         config.policy.refuse_any,
         config.logging.query_names,
         echoic::rpz::RpzPolicy::empty(),

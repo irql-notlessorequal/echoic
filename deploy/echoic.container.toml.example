@@ -5,6 +5,10 @@ query_names = false
 [policy]
 refuse_any = true
 
+[edns]
+padding_block_size = 128
+padding_random = false
+
 [[tls]]
 name = "public"
 cert = "/etc/echoic/tls/fullchain.pem"
@@ -15,7 +19,6 @@ name = "public-udp"
 protocol = "udp"
 address = "0.0.0.0:53"
 limits = { qps = 100, burst = 200 }
-edns_padding_block_size = 128
 dscp = 45
 
 [[listeners]]
@@ -23,7 +26,6 @@ name = "public-tcp"
 protocol = "tcp"
 address = "0.0.0.0:53"
 limits = { qps = 100, burst = 200, max_connections = 512 }
-edns_padding_block_size = 128
 dscp = 45
 
 [[listeners]]
@@ -32,7 +34,6 @@ protocol = "dot"
 address = "0.0.0.0:853"
 tls = "public"
 limits = { qps = 50, burst = 100, max_connections = 512 }
-edns_padding_block_size = 128
 dscp = 45
 
 [[listeners]]
@@ -42,7 +43,6 @@ address = "0.0.0.0:443"
 tls = "public"
 hostname = "dns.example.com"
 limits = { qps = 50, burst = 100, max_connections = 512, max_concurrent_requests = 128 }
-edns_padding_block_size = 128
 tcp_notsent_lowat = 16384
 
 [recursor]

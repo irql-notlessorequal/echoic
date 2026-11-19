@@ -137,6 +137,7 @@ limits = {{ max_connections = 8 }}
             tokio::sync::Semaphore::new(8),
         ))),
         &config.server_limits,
+        &config.edns,
         config.policy.refuse_any,
         false,
         echoic::rpz::RpzPolicy::empty(),

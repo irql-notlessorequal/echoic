@@ -28,6 +28,12 @@ Use `[::]` listeners where IPv6 service is required. Docker IPv6 must be enabled
 
 Monitor certificate expiry externally. Echoic reloads certificates on `SIGHUP`; it does not renew them automatically.
 
+## Logging
+
+Logs are structured JSON on stdout. Query names are omitted unless `logging.query_names = true`; DoH URLs and query strings are never logged.
+
+Per-query failure warnings are rate limited per listener and category. The first three events for DNSSEC validation failures, recursive query failures, and query timeouts appear with full detail per window. Further events are suppressed, and one summary warning per window reports the suppressed count. The burst size and window are fixed constants. Aggregate counts for failures remain available in the metrics endpoint and readiness output.
+
 ## Access and connection limits
 
 Plain DNS listeners use the private-network allow list whenever `acl.allow` is empty, including when `acl.deny` contains exclusions. Set an explicit allow range to expose plain DNS publicly. Deny entries take precedence.

@@ -192,6 +192,7 @@ async fn start_config(config: &Config, validating: bool, inflight: usize) -> Tes
         stats.clone(),
         Arc::new(ArcSwap::from_pointee(Arc::new(Semaphore::new(inflight)))),
         &config.server_limits,
+        &config.edns,
         config.policy.refuse_any,
         config.logging.query_names,
         blocklist,
@@ -613,14 +614,68 @@ async fn edns_padding_pads_response_to_block_size() {
 
     let response = Message::from_vec(&buffer[..length]).expect("decode response");
     assert_eq!(length % 128, 0);
-    assert!(
-        response
-            .edns
-            .as_ref()
-            .expect("response edns")
-            .option(EdnsCode::Padding)
-            .is_some()
-    );
+    let padding = response
+        .edns
+        .as_ref()
+        .expect("response edns")
+        .option(EdnsCode::Padding)
+        .expect("padding option");
+    match padding {
+        EdnsOption::Unknown(_, bytes) => {
+            assert!(!bytes.is_empty());
+            assert!(bytes.iter().all(|byte| *byte == 0));
+        }
+        _ => panic!("unexpected padding option"),
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn edns_padding_random_uses_nonzero_bytes() {
+    let mut config = config_for(Protocol::Udp, "");
+    config.edns.padding_block_size = 512;
+    config.edns.padding_random = true;
+    let server = start_config(&config, false, 16).await;
+    let address = server.runtime.bound_address;
+
+    let mut request = Message::query();
+    request.add_query(Query::query(
+        Name::from_ascii("example.com.").expect("name"),
+        RecordType::A,
+    ));
+    let mut edns = Edns::new();
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(EdnsCode::Padding.into(), vec![0; 8]));
+    request.set_edns(edns);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    socket
+        .send_to(&request.to_vec().expect("encode query"), address)
+        .await
+        .expect("send query");
+
+    let mut buffer = [0; 4096];
+    let (length, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .expect("query timed out")
+        .expect("receive response");
+
+    let response = Message::from_vec(&buffer[..length]).expect("decode response");
+    assert_eq!(length % 512, 0);
+    let padding = response
+        .edns
+        .as_ref()
+        .expect("response edns")
+        .option(EdnsCode::Padding)
+        .expect("padding option");
+    match padding {
+        EdnsOption::Unknown(_, bytes) => {
+            assert!(!bytes.is_empty());
+            assert!(bytes.iter().any(|byte| *byte != 0));
+        }
+        _ => panic!("unexpected padding option"),
+    }
 
     server.stop().await;
 }
